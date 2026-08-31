@@ -1,0 +1,13 @@
+# Rust 构建产物
+/target
+
+# Inno Setup 构建产物
+/installer/dist
+# 构建期生成的安装器图标(由 build.rs 生成,无需入库)
+/installer/app.ico
+
+# 工具链安装器(本地下载物)
+/*.exe
+
+# 临时/验证文件
+*.log

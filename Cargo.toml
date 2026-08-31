@@ -1,0 +1,27 @@
+[package]
+name = "cap-ime-switch"
+version = "0.1.0"
+edition = "2021"
+description = "CapsLock remap: short press switches IME (Win+Space), long press (>500ms) toggles CapsLock"
+license = "MIT"
+
+[dependencies]
+parking_lot = "0.12.5"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = 3
+strip = true
