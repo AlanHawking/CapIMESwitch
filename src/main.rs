@@ -38,7 +38,7 @@ use windows_sys::Win32::UI::Shell::{
     NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BN_CLICKED, BS_CHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
+    AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
     CreateIconFromResource, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_NUMBER, GetCursorPos,
     GetDlgItem, GetMessageW, GetSystemMetrics, GetWindowTextW, KillTimer, LoadIconW, MessageBoxW,
@@ -638,7 +638,8 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         0,
         button_class.as_ptr(),
         std::ptr::null(),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_CHECKBOX as u32,
+        // BS_AUTOCHECKBOX:点击自动切换勾选;BS_CHECKBOX 需父窗口手动切换,会导致点击无反应
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
         212,
         20,
         24,
