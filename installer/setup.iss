@@ -42,6 +42,10 @@ Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}"; Flags: nowait postinstall skipifsilent
 
+; 选项面板的配置文件(exe 同目录),程序运行期创建,卸载时一并删除
+[UninstallDelete]
+Type: files; Name: "{app}\config.toml"
+
 [Code]
 // 卸载时清除程序在 HKCU Run 键中设置的开机自启动项
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
