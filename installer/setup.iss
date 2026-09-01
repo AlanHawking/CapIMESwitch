@@ -14,6 +14,8 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+; 默认 auto 在检测到已安装(同 AppId)时隐藏目录选择页,改为始终显示
+DisableDirPage=no
 PrivilegesRequired=lowest
 OutputDir=dist
 OutputBaseFilename=CapIMESwitch-Setup-{#MyAppVersion}
