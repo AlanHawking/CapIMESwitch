@@ -16,14 +16,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
-    LRESULT, POINT, WPARAM,
+    LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Graphics::Gdi::{
-    DEFAULT_GUI_FONT, GetStockObject, SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, HBRUSH,
-    HDC,
+    DEFAULT_GUI_FONT, GetDC, GetStockObject, GetTextExtentPoint32W, ReleaseDC, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, HBRUSH, HDC,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
@@ -34,8 +35,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CAPITAL, VK_LWIN,
-    VK_SPACE,
+    SendInput, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYEVENTF_KEYUP, VK_CAPITAL, VK_LWIN, VK_SPACE,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NIF_ICON, NIF_MESSAGE, NIF_TIP,
@@ -46,22 +47,30 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowThreadProcessId,
     CreateIconFromResource, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_MULTILINE, ES_NUMBER,
-    ES_AUTOVSCROLL, ES_WANTRETURN, GetCursorPos,
-    GetDlgItem, GetMessageW, GetSystemMetrics, GetWindowTextW, KillTimer, LoadIconW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
+    ES_AUTOVSCROLL, ES_READONLY, ES_WANTRETURN, GetCursorPos,
+    GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW, GetSystemMetrics,
+    GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, KillTimer,
+    LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
     SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
-    SW_SHOW, TrackPopupMenu, WS_EX_CLIENTEDGE, GetDlgCtrlID, ICON_BIG, ICON_SMALL,
-    WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_SETICON,
+    SW_HIDE, SW_SHOW, TrackPopupMenu,
+    CallWindowProcW, WS_EX_CLIENTEDGE, ICON_BIG,
+    ICON_SMALL,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON,
     TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, HICON,
     IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MB_ICONERROR, MB_OK, MF_CHECKED,
     MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
+    WM_MOUSEMOVE,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
-    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WNDCLASSW,
+    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WNDCLASSW,
 };
 /// BM_SETCHECK / BM_GETCHECK 消息(0.59 未导出控件 API,用消息字面量)
 const BM_SETCHECK: u32 = 0x00F1;
 const BM_GETCHECK: u32 = 0x00F0;
+/// WM_MOUSELEAVE 未在 0.59 导出,用消息字面量
+const WM_MOUSELEAVE: u32 = 0x02A3;
 /// 按钮勾选状态值
 const BST_CHECKED: usize = 1;
 
@@ -93,12 +102,26 @@ const OPTIONS_WINDOW_CLASS: &str = "CapIMESwitchOptionsWindow";
 const ID_OPT_CHECK_AUTOSTART: usize = 2001;
 const ID_OPT_EDIT_DELAY: usize = 2002;
 const ID_OPT_SAVE: usize = 2003;
-/// 说明文本控件 ID(用于 WM_CTLCOLORSTATIC 区分灰色说明文字)
-const ID_OPT_HINT: usize = 2004;
 /// 排除程序输入框 ID
 const ID_OPT_EDIT_EXCLUDE: usize = 2005;
-/// 第二条说明文本 ID(排除程序说明)
-const ID_OPT_HINT2: usize = 2006;
+/// 问号帮助图标 ID(逐行一个)
+const ID_OPT_HELP_AUTOSTART: usize = 2008;
+const ID_OPT_HELP_DELAY: usize = 2009;
+const ID_OPT_HELP_EXCLUDE: usize = 2010;
+/// 版本号文本 ID(底部灰色小字)
+const ID_OPT_VERSION: usize = 2011;
+/// 说明栏控件 ID(面板底部只读文本,点击/悬浮问号时显示说明)
+const ID_OPT_HELP_BAR: usize = 2012;
+/// 说明文本(工具提示内容)
+const HELP_AUTOSTART: &str = "勾选后开机自动运行本程序,状态与托盘菜单一致,保存时生效";
+const HELP_DELAY: &str = "短按 CapsLock(未达该毫秒数松开)切换输入法;长按(达到该毫秒数)切换大小写";
+const HELP_EXCLUDE: &str =
+    "这些程序中 CapsLock 恢复原始行为,不切换输入法;多个程序用逗号或换行分隔";
+/// 静态控件样式(0.59 未导出 SS_* 常量:SS_CENTER=0x1 水平居中,
+/// SS_CENTERIMAGE=0x200 垂直居中,SS_NOTIFY=0x100 可收单击)
+const SS_CENTER: u32 = 0x0001;
+const SS_CENTERIMAGE: u32 = 0x0200;
+const SS_NOTIFY: u32 = 0x0100;
 /// 构建期生成的自绘 ICO(多尺寸 16/32/48)
 static APP_ICON_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon.ico"));
 /// 自绘图标句柄缓存(惰性加载一次,存位模式以保持 static Sync)
@@ -114,6 +137,10 @@ static LONG_PRESS_MS: Mutex<u32> = Mutex::new(config::DEFAULT_LONG_PRESS_MS);
 static EXCLUDE_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// 选项面板是否打开(打开期间屏蔽托盘交互)
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
+/// 当前点击固定的问号控件 ID(说明栏保持显示);None 表示未固定
+static HELP_PINNED: Mutex<Option<usize>> = Mutex::new(None);
+/// Static 类原始窗口过程(问号图标的子类化链回目标)
+static ORIG_STATIC_PROC: AtomicUsize = AtomicUsize::new(0);
 /// 隐藏窗口句柄(托盘回调路由),存位模式以保持 static Sync
 static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
 /// TaskbarCreated 动态消息号(资源管理器重启后重建图标)
@@ -175,14 +202,22 @@ fn load_app_icon() -> Option<HICON> {
 
 fn main() {
     unsafe {
+        log_write(&format!(
+            "CapIMESwitch v{} 启动 exe={:?}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::current_exe().unwrap_or_default()
+        ));
         // 单实例:命名互斥体跨进程唯一(类名仅进程内有效,不能用于跨进程检测)
         let mutex_name = to_utf16(SINGLE_INSTANCE_NAME);
         let instance_mutex = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
         if instance_mutex.is_null() {
+            let err = GetLastError();
+            log_write(&format!("创建实例锁失败 GetLastError={err}"));
             show_error("创建实例锁失败");
             return;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
+            log_write("检测到已有实例,退出");
             show_error("CapIMESwitch 已在运行中,请从系统托盘操作。");
             return;
         }
@@ -191,20 +226,29 @@ fn main() {
         let hmod = GetModuleHandleW(std::ptr::null::<u16>());
 
         if !register_window_class(hmod) {
-            show_error(&format!("注册窗口类失败, GetLastError={}", GetLastError()));
+            let err = GetLastError();
+            log_write(&format!("注册主窗口类失败 GetLastError={err}"));
+            show_error(&format!("注册窗口类失败, GetLastError={err}"));
             return;
         }
+        log_write("主窗口类注册成功");
         if !register_options_window_class(hmod) {
-            show_error(&format!("注册选项窗口类失败, GetLastError={}", GetLastError()));
+            let err = GetLastError();
+            log_write(&format!("注册选项面板窗口类失败 GetLastError={err}"));
+            show_error(&format!("注册选项窗口类失败, GetLastError={err}"));
             return;
         }
+        log_write("选项面板窗口类注册成功");
 
         let hwnd = create_hidden_window(hmod);
         if hwnd.is_null() {
+            let err = GetLastError();
+            log_write(&format!("创建托盘窗口失败 GetLastError={err}"));
             show_error("创建托盘窗口失败");
             return;
         }
         TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
+        log_write(&format!("托盘窗口创建成功 hwnd={hwnd:?}"));
 
         // 监听资源管理器重启(托盘图标丢失时自动重建)
         let class_name = to_utf16("TaskbarCreated");
@@ -214,9 +258,12 @@ fn main() {
         );
 
         if !add_tray_icon(hwnd) {
+            let err = GetLastError();
+            log_write(&format!("添加托盘图标失败 GetLastError={err}"));
             show_error("添加托盘图标失败");
             return;
         }
+        log_write("托盘图标添加成功");
 
         // 加载持久化设置(缺失或损坏时保持默认值)
         if let Some(path) = config_path() {
@@ -227,9 +274,12 @@ fn main() {
 
         let hook: HHOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0);
         if hook.is_null() {
-            show_error(&format!("安装键盘钩子失败, GetLastError={}", GetLastError()));
+            let err = GetLastError();
+            log_write(&format!("安装键盘钩子失败 GetLastError={err}"));
+            show_error(&format!("安装键盘钩子失败, GetLastError={err}"));
             return;
         }
+        log_write("键盘钩子安装成功,进入消息循环");
 
         // 消息泵:派发托盘回调、WM_TIMER 与 WM_DESTROY 给窗口过程
         let mut msg: MSG = std::mem::zeroed();
@@ -245,6 +295,7 @@ fn main() {
             }
         }
 
+        log_write("程序退出");
         KillTimer(hwnd, CAPS_TIMER_ID);
         remove_tray_icon(hwnd);
         UnhookWindowsHookEx(hook);
@@ -553,6 +604,46 @@ fn config_path() -> Option<std::path::PathBuf> {
         .map(|p| p.join("config.toml"))
 }
 
+// ---------- 日志 ----------
+
+/// 日志文件路径:exe 同目录 cap-ime-switch.log
+fn log_path() -> Option<std::path::PathBuf> {
+    std::env::current_exe()
+        .ok()?
+        .parent()
+        .map(|p| p.join("cap-ime-switch.log"))
+}
+
+/// 本地时间戳字符串(用于日志行前缀)
+fn log_timestamp() -> String {
+    unsafe {
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        )
+    }
+}
+
+/// 追加写日志(exe 同目录 cap-ime-switch.log):超过 1MB 时清空重写,失败静默
+fn log_write(msg: &str) {
+    use std::io::Write;
+    let Some(path) = log_path() else { return };
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 1024 * 1024 {
+            let _ = std::fs::write(&path, b"");
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{} {}", log_timestamp(), msg);
+    }
+}
+
 // ---------- 选项面板 ----------
 
 /// 注册选项面板窗口类(独立 WndProc 处理面板消息)
@@ -605,6 +696,7 @@ unsafe fn open_options_panel(owner: HWND) {
         return;
     }
     OPTIONS_OPEN.store(true, Ordering::Relaxed);
+    log_write(&format!("打开选项面板 hwnd={hwnd:?}"));
     create_options_controls(hwnd, hmod);
     // 标题栏图标与程序托盘图标一致
     if let Some(icon) = load_app_icon() {
@@ -620,24 +712,178 @@ unsafe fn set_control_font(hwnd: HWND) {
     SendMessageW(hwnd, WM_SETFONT, font as usize as WPARAM, 1 as LPARAM);
 }
 
+/// 创建问号帮助图标(16x16 "?" 文本居中,不依赖图标 API,任何环境必然可见)
+unsafe fn create_help_icon(
+    parent: HWND,
+    hmod: *mut core::ffi::c_void,
+    ctrl_id: usize,
+    x: i32,
+    y: i32,
+) -> HWND {
+    let class = to_utf16("Static");
+    let text = to_utf16("?");
+    let help = CreateWindowExW(
+        0,
+        class.as_ptr(),
+        text.as_ptr(),
+        WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY,
+        x,
+        y,
+        16,
+        16,
+        parent,
+        (ctrl_id as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !help.is_null() {
+        set_control_font(help);
+    }
+    help
+}
+
+/// 在说明栏显示指定问号的说明文本(其他问号文本互斥,直接覆盖)
+unsafe fn show_help_bar(parent: HWND, ctrl_id: usize) {
+    let text = match ctrl_id {
+        ID_OPT_HELP_AUTOSTART => HELP_AUTOSTART,
+        ID_OPT_HELP_DELAY => HELP_DELAY,
+        ID_OPT_HELP_EXCLUDE => HELP_EXCLUDE,
+        _ => return,
+    };
+    let bar = GetDlgItem(parent, ID_OPT_HELP_BAR as i32);
+    let w = to_utf16(text);
+    SetWindowTextW(bar, w.as_ptr());
+    ShowWindow(bar, SW_SHOW);
+}
+
+/// 隐藏说明栏
+unsafe fn hide_help_bar(parent: HWND) {
+    let bar = GetDlgItem(parent, ID_OPT_HELP_BAR as i32);
+    ShowWindow(bar, SW_HIDE);
+}
+
+/// 点击问号:固定显示对应说明,再次点击(或点击其他问号)时切换隐藏
+unsafe fn on_help_icon_click(parent: HWND, ctrl_id: usize) {
+    {
+        let mut pinned = HELP_PINNED.lock();
+        if *pinned == Some(ctrl_id) {
+            *pinned = None;
+            drop(pinned);
+            hide_help_bar(parent);
+            log_write(&format!("帮助说明已隐藏: ctrl_id={ctrl_id}"));
+            return;
+        }
+        *pinned = Some(ctrl_id);
+    }
+    show_help_bar(parent, ctrl_id);
+    log_write(&format!("帮助说明固定显示: ctrl_id={ctrl_id}"));
+}
+
+/// 子类化问号图标控件:悬浮(WM_MOUSEMOVE)显示说明栏,移开(WM_MOUSELEAVE)隐藏,
+/// 点击固定期间保持显示。
+unsafe fn subclass_help_icon(help: HWND) {
+    if ORIG_STATIC_PROC.load(Ordering::Relaxed) == 0 {
+        let cls = GetClassLongPtrW(help, GCLP_WNDPROC) as usize;
+        ORIG_STATIC_PROC.store(cls, Ordering::Relaxed);
+    }
+    SetWindowLongPtrW(help, GWLP_WNDPROC, help_icon_subproc as *const () as isize);
+}
+
+/// 问号图标子类化窗口过程
+unsafe extern "system" fn help_icon_subproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let original = ORIG_STATIC_PROC.load(Ordering::Relaxed) as isize;
+    match msg {
+        WM_MOUSEMOVE => {
+            let parent = GetParent(hwnd);
+            if !parent.is_null() {
+                show_help_bar(parent, GetDlgCtrlID(hwnd) as usize);
+                // 一次性登记鼠标离开通知,每次 move 需重新登记
+                let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
+                tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = hwnd;
+                TrackMouseEvent(&mut tme);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            let pinned_now = *HELP_PINNED.lock();
+            if pinned_now != Some(GetDlgCtrlID(hwnd) as usize) {
+                hide_help_bar(GetParent(hwnd));
+            }
+            0
+        }
+        _ => {
+            if original == 0 {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
+        }
+    }
+}
+
 /// 创建选项面板子控件。
-/// 布局:左侧标签列(右对齐、统一宽度)+ 右侧控件列(勾选框/输入框,统一起始 x),
-/// 两行结构完全对齐;说明文字为灰色独立一行;保存按钮位于右下角。
+/// 布局:左侧固定宽度名称列(左对齐)+ 问号帮助图标 + 右侧占满剩余空间的输入列;
+/// 说明文字默认隐藏,悬浮/点击问号时通过工具提示显示;版本号位于底部左侧。
 unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     let button_class = to_utf16("Button");
     let edit_class = to_utf16("Edit");
     let static_class = to_utf16("Static");
 
-    // 行 1:标签(右对齐)+ 无字勾选框(控件列起始 x=212)
-    let check_label = to_utf16("开机启动:");
+    // 运行时测量最宽标题的像素宽度(按实际字体/DPI),左侧列宽随内容而定
+    let dc = GetDC(parent);
+    let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    let mut text_size: SIZE = std::mem::zeroed();
+    let mut max_label = 0i32;
+    for title in ["开机启动", "长按延迟(毫秒)", "排除程序"] {
+        let w = to_utf16(title);
+        if GetTextExtentPoint32W(
+            dc,
+            w.as_ptr(),
+            title.encode_utf16().count() as i32,
+            &mut text_size,
+        ) != 0
+        {
+            max_label = max_label.max(text_size.cx);
+        }
+    }
+    // 全部测量失败时才用固定兜底宽度(避免兜底值污染真实测量)
+    if max_label <= 0 {
+        max_label = 130;
+    }
+    SelectObject(dc, old_font);
+    ReleaseDC(parent, dc);
+    // 布局基准为窗口客户区宽度(440 是含边框的外框宽,客户区小约 16px,
+    // 若不修正,右侧控件会贴着客户区右缘,看起来没有边距)
+    let mut client: RECT = std::mem::zeroed();
+    GetClientRect(parent, &mut client);
+    let client_w = client.right;
+    // 标题 16..16+max_label,问号 16x16(+4 间距),输入列(+12 间距)占满至右缘 16
+    const HELP_W: i32 = 16;
+    const HELP_GAP: i32 = 4;
+    const COL_GAP: i32 = 12;
+    let help_x = 16 + max_label + HELP_GAP;
+    let right_x = help_x + HELP_W + COL_GAP;
+    let right_w = client_w - 16 - right_x;
+    log_write(&format!(
+        "选项面板布局: 客户区宽={client_w} 标题宽={max_label} 问号x={help_x} 输入列x={right_x} 宽={right_w}"
+    ));
+
+    // 行 1:名称(左对齐)+ 问号 + 无字勾选框
+    let check_label = to_utf16("开机启动");
     let label1 = CreateWindowExW(
         0,
         static_class.as_ptr(),
         check_label.as_ptr(),
-        WS_CHILD | WS_VISIBLE | 0x0002, // SS_RIGHT
+        WS_CHILD | WS_VISIBLE,
         16,
         22,
-        190,
+        max_label,
         20,
         parent,
         std::ptr::null_mut(),
@@ -648,13 +894,18 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(label1);
     }
 
+    let help1 = create_help_icon(parent, hmod, ID_OPT_HELP_AUTOSTART, help_x, 22);
+    if !help1.is_null() {
+        subclass_help_icon(help1);
+    }
+
     let check = CreateWindowExW(
         0,
         button_class.as_ptr(),
         std::ptr::null(),
         // BS_AUTOCHECKBOX:点击自动切换勾选;BS_CHECKBOX 需父窗口手动切换,会导致点击无反应
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
-        212,
+        right_x,
         20,
         24,
         24,
@@ -671,16 +922,16 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         }
     }
 
-    // 行 2:标签(右对齐)+ 延迟输入框,与行 1 控件列齐平
-    let label_text = to_utf16("大写锁切换延迟(毫秒):");
+    // 行 2:名称(左对齐)+ 问号 + 延迟输入框
+    let label_text = to_utf16("长按延迟(毫秒)");
     let label = CreateWindowExW(
         0,
         static_class.as_ptr(),
         label_text.as_ptr(),
-        WS_CHILD | WS_VISIBLE | 0x0002, // SS_RIGHT
+        WS_CHILD | WS_VISIBLE,
         16,
         58,
-        190,
+        max_label,
         20,
         parent,
         std::ptr::null_mut(),
@@ -691,6 +942,11 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(label);
     }
 
+    let help2 = create_help_icon(parent, hmod, ID_OPT_HELP_DELAY, help_x, 58);
+    if !help2.is_null() {
+        subclass_help_icon(help2);
+    }
+
     let cur_ms = *LONG_PRESS_MS.lock();
     let cur_text = to_utf16(&cur_ms.to_string());
     let edit = CreateWindowExW(
@@ -698,9 +954,9 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         edit_class.as_ptr(),
         cur_text.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
-        212,
+        right_x,
         56,
-        112,
+        right_w,
         24,
         parent,
         (ID_OPT_EDIT_DELAY as usize) as *mut core::ffi::c_void,
@@ -711,35 +967,16 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(edit);
     }
 
-    // 行为说明:灰色小字独立一行(颜色由 options_wnd_proc 的 WM_CTLCOLORSTATIC 处理)
-    let hint_text = to_utf16("长按 CapsLock 达到该毫秒数后切换大小写，否则短按切换输入法");
-    let hint = CreateWindowExW(
-        0,
-        static_class.as_ptr(),
-        hint_text.as_ptr(),
-        WS_CHILD | WS_VISIBLE,
-        16,
-        166,
-        408,
-        20,
-        parent,
-        (ID_OPT_HINT as usize) as *mut core::ffi::c_void,
-        hmod,
-        std::ptr::null_mut(),
-    );
-    if !hint.is_null() {
-        set_control_font(hint);
-    }
-    // 行 3:标签(右对齐)+ 排除程序输入框(逗号分隔 exe 文件名)
-    let exclude_label_text = to_utf16("排除程序(exe 文件名):");
+    // 行 3:名称(左对齐)+ 问号 + 排除程序多行输入框
+    let exclude_label_text = to_utf16("排除程序");
     let label3 = CreateWindowExW(
         0,
         static_class.as_ptr(),
         exclude_label_text.as_ptr(),
-        WS_CHILD | WS_VISIBLE | 0x0002, // SS_RIGHT
+        WS_CHILD | WS_VISIBLE,
         16,
         94,
-        190,
+        max_label,
         20,
         parent,
         std::ptr::null_mut(),
@@ -748,6 +985,11 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     );
     if !label3.is_null() {
         set_control_font(label3);
+    }
+
+    let help3 = create_help_icon(parent, hmod, ID_OPT_HELP_EXCLUDE, help_x, 94);
+    if !help3.is_null() {
+        subclass_help_icon(help3);
     }
 
     let cur_exclude = EXCLUDE_PROCESSES.lock().join("\r\n");
@@ -763,9 +1005,9 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
             | ES_MULTILINE as u32
             | ES_AUTOVSCROLL as u32
             | ES_WANTRETURN as u32,
-        212,
+        right_x,
         92,
-        212,
+        right_w,
         68,
         parent,
         (ID_OPT_EDIT_EXCLUDE as usize) as *mut core::ffi::c_void,
@@ -776,24 +1018,44 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(edit2);
     }
 
-    // 排除程序说明:灰色小字独立一行
-    let hint2_text = to_utf16("这些程序中 CapsLock 恢复原始行为,多个程序用逗号分隔(如 notepad.exe)");
-    let hint2 = CreateWindowExW(
+    // 说明栏:只读多行文本,点击/悬浮问号时在此显示对应说明,默认隐藏
+    let bar = CreateWindowExW(
         0,
-        static_class.as_ptr(),
-        hint2_text.as_ptr(),
-        WS_CHILD | WS_VISIBLE,
+        edit_class.as_ptr(),
+        std::ptr::null(),
+        WS_CHILD | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
         16,
-        188,
+        166,
         408,
-        20,
+        40,
         parent,
-        (ID_OPT_HINT2 as usize) as *mut core::ffi::c_void,
+        (ID_OPT_HELP_BAR as usize) as *mut core::ffi::c_void,
         hmod,
         std::ptr::null_mut(),
     );
-    if !hint2.is_null() {
-        set_control_font(hint2);
+    if !bar.is_null() {
+        set_control_font(bar);
+        ShowWindow(bar, SW_HIDE);
+    }
+
+    // 版本号:底部左侧灰色小字(env! 与 Cargo.toml 同步)
+    let ver_text = to_utf16(&format!("版本 {}", env!("CARGO_PKG_VERSION")));
+    let ver = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        ver_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        16,
+        219,
+        200,
+        20,
+        parent,
+        (ID_OPT_VERSION as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !ver.is_null() {
+        set_control_font(ver);
     }
 
     // 保存按钮(右下角,右/下边距 24)
@@ -803,7 +1065,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         button_class.as_ptr(),
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
-        336,
+        client_w - 24 - 80,
         212,
         80,
         28,
@@ -830,18 +1092,23 @@ unsafe extern "system" fn options_wnd_proc(
             let code = ((wparam as usize) >> 16) & 0xffff;
             if id == ID_OPT_SAVE && code as u32 == BN_CLICKED {
                 save_options(hwnd);
+            } else if code as u32 == BN_CLICKED
+                && (id == ID_OPT_HELP_AUTOSTART
+                    || id == ID_OPT_HELP_DELAY
+                    || id == ID_OPT_HELP_EXCLUDE)
+            {
+                // 问号图标点击:固定显示/隐藏说明(静态控件通知码 STN_CLICKED=0 与 BN_CLICKED 相同)
+                on_help_icon_click(hwnd, id);
             }
             0
         }
         // 标签/说明文字绘制:白色背景融入面板,说明文字用灰色与主标签区分
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
             let hdc = wparam as HDC;
             SetBkMode(hdc, TRANSPARENT as i32);
             let ctrl_id = GetDlgCtrlID(lparam as HWND);
-            if msg == WM_CTLCOLORSTATIC
-                && (ctrl_id == ID_OPT_HINT as i32 || ctrl_id == ID_OPT_HINT2 as i32)
-            {
-                SetTextColor(hdc, 0x00808080); // 灰色说明,与黑色标签区分
+            if msg == WM_CTLCOLORSTATIC && ctrl_id == ID_OPT_VERSION as i32 {
+                SetTextColor(hdc, 0x00808080); // 版本号灰色,与主标签区分
             } else {
                 SetTextColor(hdc, 0x00000000); // 黑色主标签
             }
@@ -854,6 +1121,7 @@ unsafe extern "system" fn options_wnd_proc(
         // 不 PostQuitMessage:主消息泵由托盘窗口的 WM_DESTROY 终止
         WM_DESTROY => {
             OPTIONS_OPEN.store(false, Ordering::Relaxed);
+            HELP_PINNED.lock().take();
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -896,9 +1164,11 @@ unsafe fn save_options(hwnd: HWND) {
         exclude_processes: exclude.clone(),
     };
     if !config::save(&cfg, &path) {
+        log_write("保存 config.toml 失败");
         show_error("保存设置失败");
         return;
     }
+    log_write(&format!("保存设置: 延迟={ms}ms 排除={exclude:?}"));
     *LONG_PRESS_MS.lock() = ms;
     *EXCLUDE_PROCESSES.lock() = exclude;
 
@@ -918,6 +1188,7 @@ unsafe fn save_options(hwnd: HWND) {
             reg_delete_value(HKEY_CURRENT_USER, AUTOSTART_KEY, AUTOSTART_VALUE_NAME)
         };
     if !ok {
+        log_write("保存开机自启动设置失败");
         show_error("保存开机自启动设置失败");
         return;
     }
