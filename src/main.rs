@@ -18,6 +18,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
     LRESULT, POINT, WPARAM,
 };
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetStockObject, SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, HBRUSH,
     HDC,
@@ -28,7 +29,10 @@ use windows_sys::Win32::System::Registry::{
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
     REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CAPITAL, VK_LWIN,
     VK_SPACE,
@@ -39,8 +43,10 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
+    GetForegroundWindow, GetWindowThreadProcessId,
     CreateIconFromResource, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_NUMBER, GetCursorPos,
+    DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_MULTILINE, ES_NUMBER,
+    ES_AUTOVSCROLL, ES_WANTRETURN, GetCursorPos,
     GetDlgItem, GetMessageW, GetSystemMetrics, GetWindowTextW, KillTimer, LoadIconW, MessageBoxW,
     PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageW,
     SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
@@ -51,7 +57,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
-    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WNDCLASSW,
+    WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL, WNDCLASSW,
 };
 /// BM_SETCHECK / BM_GETCHECK 消息(0.59 未导出控件 API,用消息字面量)
 const BM_SETCHECK: u32 = 0x00F1;
@@ -89,6 +95,10 @@ const ID_OPT_EDIT_DELAY: usize = 2002;
 const ID_OPT_SAVE: usize = 2003;
 /// 说明文本控件 ID(用于 WM_CTLCOLORSTATIC 区分灰色说明文字)
 const ID_OPT_HINT: usize = 2004;
+/// 排除程序输入框 ID
+const ID_OPT_EDIT_EXCLUDE: usize = 2005;
+/// 第二条说明文本 ID(排除程序说明)
+const ID_OPT_HINT2: usize = 2006;
 /// 构建期生成的自绘 ICO(多尺寸 16/32/48)
 static APP_ICON_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon.ico"));
 /// 自绘图标句柄缓存(惰性加载一次,存位模式以保持 static Sync)
@@ -100,6 +110,8 @@ static WATCHER: Mutex<CapsWatcher> = Mutex::new(CapsWatcher::new());
 static TIMER_ARMED: Mutex<bool> = Mutex::new(false);
 /// 当前生效的长按判定阈值(毫秒):启动时从 config.toml 加载,保存设置后更新
 static LONG_PRESS_MS: Mutex<u32> = Mutex::new(config::DEFAULT_LONG_PRESS_MS);
+/// 排除程序列表(小写 exe 文件名):启动时从 config.toml 加载,保存设置后更新
+static EXCLUDE_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// 选项面板是否打开(打开期间屏蔽托盘交互)
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
 /// 隐藏窗口句柄(托盘回调路由),存位模式以保持 static Sync
@@ -206,9 +218,11 @@ fn main() {
             return;
         }
 
-        // 加载持久化的长按阈值(缺失或损坏时保持默认值)
+        // 加载持久化设置(缺失或损坏时保持默认值)
         if let Some(path) = config_path() {
-            *LONG_PRESS_MS.lock() = config::load(&path).long_press_ms;
+            let cfg = config::load(&path);
+            *LONG_PRESS_MS.lock() = cfg.long_press_ms;
+            *EXCLUDE_PROCESSES.lock() = cfg.exclude_processes;
         }
 
         let hook: HHOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0);
@@ -569,7 +583,7 @@ unsafe fn open_options_panel(owner: HWND) {
     let class_name = to_utf16(OPTIONS_WINDOW_CLASS);
     let title = to_utf16("CapIMESwitch 选项");
     const W: i32 = 440;
-    const H: i32 = 220;
+    const H: i32 = 300;
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let hwnd = CreateWindowExW(
@@ -705,7 +719,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         hint_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         16,
-        98,
+        166,
         408,
         20,
         parent,
@@ -716,6 +730,71 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     if !hint.is_null() {
         set_control_font(hint);
     }
+    // 行 3:标签(右对齐)+ 排除程序输入框(逗号分隔 exe 文件名)
+    let exclude_label_text = to_utf16("排除程序(exe 文件名):");
+    let label3 = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        exclude_label_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE | 0x0002, // SS_RIGHT
+        16,
+        94,
+        190,
+        20,
+        parent,
+        std::ptr::null_mut(),
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !label3.is_null() {
+        set_control_font(label3);
+    }
+
+    let cur_exclude = EXCLUDE_PROCESSES.lock().join("\r\n");
+    let cur_exclude_text = to_utf16(&cur_exclude);
+    let edit2 = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        edit_class.as_ptr(),
+        cur_exclude_text.as_ptr(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_VSCROLL as u32
+            | ES_MULTILINE as u32
+            | ES_AUTOVSCROLL as u32
+            | ES_WANTRETURN as u32,
+        212,
+        92,
+        212,
+        68,
+        parent,
+        (ID_OPT_EDIT_EXCLUDE as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !edit2.is_null() {
+        set_control_font(edit2);
+    }
+
+    // 排除程序说明:灰色小字独立一行
+    let hint2_text = to_utf16("这些程序中 CapsLock 恢复原始行为,多个程序用逗号分隔(如 notepad.exe)");
+    let hint2 = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        hint2_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        16,
+        188,
+        408,
+        20,
+        parent,
+        (ID_OPT_HINT2 as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !hint2.is_null() {
+        set_control_font(hint2);
+    }
 
     // 保存按钮(右下角,右/下边距 24)
     let save_label = to_utf16("保存");
@@ -725,7 +804,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         336,
-        137,
+        212,
         80,
         28,
         parent,
@@ -758,7 +837,10 @@ unsafe extern "system" fn options_wnd_proc(
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             let hdc = wparam as HDC;
             SetBkMode(hdc, TRANSPARENT as i32);
-            if msg == WM_CTLCOLORSTATIC && GetDlgCtrlID(lparam as HWND) == ID_OPT_HINT as i32 {
+            let ctrl_id = GetDlgCtrlID(lparam as HWND);
+            if msg == WM_CTLCOLORSTATIC
+                && (ctrl_id == ID_OPT_HINT as i32 || ctrl_id == ID_OPT_HINT2 as i32)
+            {
                 SetTextColor(hdc, 0x00808080); // 灰色说明,与黑色标签区分
             } else {
                 SetTextColor(hdc, 0x00000000); // 黑色主标签
@@ -802,12 +884,23 @@ unsafe fn save_options(hwnd: HWND) {
             return;
         }
     };
-    let cfg = config::Config { long_press_ms: ms };
+    let exclude_text = {
+        let edit2 = GetDlgItem(hwnd, ID_OPT_EDIT_EXCLUDE as i32);
+        let mut buf = [0u16; 2048];
+        let len = GetWindowTextW(edit2, buf.as_mut_ptr(), buf.len() as i32);
+        String::from_utf16_lossy(&buf[..len.max(0) as usize])
+    };
+    let exclude = config::parse_exclude_list(&exclude_text);
+    let cfg = config::Config {
+        long_press_ms: ms,
+        exclude_processes: exclude.clone(),
+    };
     if !config::save(&cfg, &path) {
         show_error("保存设置失败");
         return;
     }
     *LONG_PRESS_MS.lock() = ms;
+    *EXCLUDE_PROCESSES.lock() = exclude;
 
     // 开机启动:勾选与当前注册表一致则跳过,否则写入或删除
     let check = GetDlgItem(hwnd, ID_OPT_CHECK_AUTOSTART as i32);
@@ -847,6 +940,46 @@ fn show_error(message: &str) {
 
 // ---------- 键盘钩子 ----------
 
+/// 排除程序列表是否命中当前前景进程;列表为空时直接返回 false(不查窗口)
+fn is_excluded_process() -> bool {
+    let list = EXCLUDE_PROCESSES.lock();
+    if list.is_empty() {
+        return false;
+    }
+    foreground_exe_name().is_some_and(|exe| config::is_excluded(&exe, &list))
+}
+
+/// 前景窗口所属进程的 exe 文件名(小写),查询失败返回 None。
+/// 键盘输入目标即前景窗口,仅用于钩子回调判断按键归属进程。
+fn foreground_exe_name() -> Option<String> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let mut size = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, 0, buf.as_mut_ptr(), &mut size);
+        CloseHandle(process);
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_lowercase())
+    }
+}
+
 /// 低级键盘钩子回调。返回 1 表示吞掉该事件。
 unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code == HC_ACTION as i32 {
@@ -855,18 +988,22 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
         // 我们注入的事件带 LLKHF_INJECTED,直接放行,避免递归
         if kb.flags & LLKHF_INJECTED == 0 {
             let is_caps = kb.vkCode == VK_CAPITAL as u32;
-            let action = match wparam as u32 {
-                WM_KEYDOWN | WM_SYSKEYDOWN => on_key_down(kb.vkCode),
-                WM_KEYUP | WM_SYSKEYUP => on_key_up(kb.vkCode),
-                _ => None,
-            };
+            // 排除程序:CapsLock 恢复原始行为,不进入状态机、不吞事件
+            let excluded = is_caps && is_excluded_process();
+            if !excluded {
+                let action = match wparam as u32 {
+                    WM_KEYDOWN | WM_SYSKEYDOWN => on_key_down(kb.vkCode),
+                    WM_KEYUP | WM_SYSKEYUP => on_key_up(kb.vkCode),
+                    _ => None,
+                };
 
-            if is_caps {
-                // 吞噬 CapsLock 的原始事件,防止系统默认切换大小写
-                if let Some(act) = action {
-                    execute(act);
+                if is_caps {
+                    // 吞噬 CapsLock 的原始事件,防止系统默认切换大小写
+                    if let Some(act) = action {
+                        execute(act);
+                    }
+                    return 1;
                 }
-                return 1;
             }
         }
     }

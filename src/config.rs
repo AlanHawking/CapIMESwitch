@@ -20,6 +20,9 @@ pub struct Config {
     /// 长按 CapsLock 切换大小写所需毫秒数(短于此值松开则切换输入法)
     #[serde(default = "default_long_press_ms")]
     pub long_press_ms: u32,
+    /// 排除程序列表(exe 文件名,小写):在这些程序中 CapsLock 恢复原始行为
+    #[serde(default)]
+    pub exclude_processes: Vec<String>,
 }
 
 fn default_long_press_ms() -> u32 {
@@ -30,6 +33,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             long_press_ms: DEFAULT_LONG_PRESS_MS,
+            exclude_processes: Vec::new(),
         }
     }
 }
@@ -40,8 +44,24 @@ impl Config {
         if !(MIN_LONG_PRESS_MS..=MAX_LONG_PRESS_MS).contains(&self.long_press_ms) {
             self.long_press_ms = DEFAULT_LONG_PRESS_MS;
         }
+        // 统一 trim + 转小写 + 去空项,保证与 UI 保存时写入的格式一致
+        self.exclude_processes = parse_exclude_list(&self.exclude_processes.join(","));
         self
     }
+}
+
+/// 解析排除程序输入:逗号/全角逗号/换行分隔,逐项 trim 并转小写,丢弃空项
+pub fn parse_exclude_list(s: &str) -> Vec<String> {
+    s.split([',', '，', '\n', '\r'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// 判断 exe 文件名是否命中排除列表(大小写不敏感精确匹配,不匹配前缀)
+pub fn is_excluded(exe: &str, list: &[String]) -> bool {
+    list.iter().any(|item| item.eq_ignore_ascii_case(exe))
 }
 
 /// 从路径加载配置:缺失、解析失败或值非法时回退默认
@@ -84,6 +104,7 @@ mod tests {
         let _ = fs::remove_file(&p);
         let cfg = Config {
             long_press_ms: 800,
+            exclude_processes: vec!["a.exe".to_string(), "b.exe".to_string()],
         };
         assert!(save(&cfg, &p));
         assert_eq!(load(&p), cfg);
@@ -117,5 +138,50 @@ mod tests {
         fs::write(&p, "# 空配置\n").unwrap();
         assert_eq!(load(&p), Config::default());
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn parse_exclude_list_splits_and_normalizes() {
+        let list = parse_exclude_list(" Notepad.exe , CODE.EXE,  , notepad.exe\nvscode.exe");
+        assert_eq!(
+            list,
+            vec![
+                "notepad.exe",
+                "code.exe",
+                "notepad.exe",
+                "vscode.exe"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_exclude_list_supports_fullwidth_comma_and_blank() {
+        let list = parse_exclude_list("wechat.exe，qq.exe");
+        assert_eq!(list, vec!["wechat.exe", "qq.exe"]);
+        assert!(parse_exclude_list(" , ，\n ").is_empty());
+        assert!(parse_exclude_list("").is_empty());
+    }
+
+    #[test]
+    fn is_excluded_matches_case_insensitively() {
+        assert!(is_excluded("NotePad.EXE", &["notepad.exe".to_string()]));
+        assert!(is_excluded("notepad.exe", &["NOTEPAD.EXE".to_string()]));
+    }
+
+    #[test]
+    fn is_excluded_rejects_partial_matches_and_empty_list() {
+        assert!(!is_excluded("notepad2.exe", &["notepad.exe".to_string()]));
+        assert!(!is_excluded("notepad.exe", &[]));
+    }
+
+    #[test]
+    fn sanitized_normalizes_exclude_list() {
+        let cfg = Config {
+            long_press_ms: 500,
+            exclude_processes: vec![" Notepad.EXE ".to_string()],
+        };
+        let cfg = cfg.sanitized();
+        assert_eq!(cfg.exclude_processes, vec!["notepad.exe".to_string()]);
+        assert_eq!(cfg.long_press_ms, 500);
     }
 }
