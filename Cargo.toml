@@ -1,6 +1,6 @@
 [package]
 name = "cap-ime-switch"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "CapsLock remap: short press switches IME (Win+Space), long press (>500ms) toggles CapsLock"
 license = "MIT"
