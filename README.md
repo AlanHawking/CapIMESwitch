@@ -10,6 +10,16 @@ CapsLock 作为系统输入法快捷键「Win+Space」与原生大小写锁定�
 - English / 中文
 - MIT License
 
+## Background / 项目背景
+
+The project was created to unify the input-method switching experience across macOS and Windows. On macOS, `Ctrl+Shift+Space` toggles the input method regardless of the current language; Windows instead relies on `Win+Space`, which is a system-reserved shortcut and cannot be individually remapped. This forces users to internalize two different, platform-specific keystrokes when switching between the two systems.
+
+创建该项目是为了统一 macOS 与 Windows 的输入法切换方式。macOS 上通过 `Ctrl+Shift+Space` 即可切换输入法，不受当前语言影响；而 Windows 依赖系统保留快捷键 `Win+Space`，无法单独重映射。这迫使习惯在两种系统间切换的用户必须记住两套不同的按键操作。
+
+CapIMESwitch maps the Windows side to **CapsLock (short press) for input-method switching**, giving Windows a single, uniform and truly system-level switching gesture that is as effortless on Windows as `Ctrl+Shift+Space` is on macOS — so the switching habit stays consistent no matter which system you are on.
+
+CapIMESwitch 将 Windows 侧统一为「**短按 CapsLock 切换输入法**」，使 Windows 拥有与 macOS `Ctrl+Shift+Space` 同样顺手、同样系统级的统一切换手势——无论在哪套系统上，切换输入法的习惯保持一致。
+
 ## Requirements / 系统要求
 
 | | |
