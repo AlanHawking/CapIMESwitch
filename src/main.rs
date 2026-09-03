@@ -444,11 +444,10 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let menu = CreatePopupMenu();
     let strings = tr();
 
-    // 开机启动:根据注册表当前状态显示勾选
+    // 开机启动:根据注册表当前状态用图标颜色区分(启用=绿,关闭=红)
     let auto_start = is_autostart_enabled();
     let autostart_label = to_utf16(strings.menu_autostart);
-    let autostart_flags = MF_STRING | if auto_start { MF_CHECKED } else { 0 };
-    AppendMenuW(menu, autostart_flags, ID_MENU_AUTOSTART, autostart_label.as_ptr());
+    AppendMenuW(menu, MF_STRING, ID_MENU_AUTOSTART, autostart_label.as_ptr());
 
     let options_label = to_utf16(strings.menu_options);
     AppendMenuW(menu, MF_STRING, ID_MENU_OPTIONS, options_label.as_ptr());
@@ -481,7 +480,8 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, ID_MENU_EXIT, exit_label.as_ptr());
 
     // 给各菜单项挂左侧图标(语言地球/开机启动电源/选项滑杆/退出 X)
-    set_menu_item_icon(menu, ID_MENU_AUTOSTART, menu_icon_bitmap(MenuIcon::Autostart));
+    let autostart_icon = if auto_start { MenuIcon::AutostartOn } else { MenuIcon::AutostartOff };
+    set_menu_item_icon(menu, ID_MENU_AUTOSTART, menu_icon_bitmap(autostart_icon));
     set_menu_item_icon(menu, ID_MENU_OPTIONS, menu_icon_bitmap(MenuIcon::Options));
     set_menu_item_icon(menu, lang_menu as usize, menu_icon_bitmap(MenuIcon::Language));
     set_menu_item_icon(menu, ID_MENU_EXIT, menu_icon_bitmap(MenuIcon::Exit));
@@ -583,6 +583,10 @@ const MENU_ICON_SIZE: i32 = 16;
 const ICON_BLUE: [f32; 3] = [0.13, 0.55, 1.0];
 /// 地球经纬线亮色
 const ICON_LIGHT: [f32; 3] = [0.70, 0.86, 1.0];
+/// 开机启动启用色(绿)
+const ICON_ON: [f32; 3] = [0.20, 0.75, 0.35];
+/// 开机启动禁用色(红)
+const ICON_OFF: [f32; 3] = [0.85, 0.28, 0.25];
 
 /// 托盘菜单/选项面板图标种类
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -591,6 +595,10 @@ enum MenuIcon {
     Language,
     /// 开机启动:电源按钮
     Autostart,
+    /// 开机启动已启用:绿色电源
+    AutostartOn,
+    /// 开机启动已关闭:灰色电源
+    AutostartOff,
     /// 选项:滑杆
     Options,
     /// 退出:X
@@ -718,8 +726,8 @@ fn draw_globe(p: &mut Rgba, x: f32, y: f32) {
     }
 }
 
-/// 绘制电源按钮:顶部开口圆环 + 竖直短杆
-fn draw_power(p: &mut Rgba, x: f32, y: f32) {
+/// 绘制电源按钮(指定颜色):顶部开口圆环 + 竖直短杆
+fn draw_power_color(p: &mut Rgba, x: f32, y: f32, color: [f32; 3]) {
     const CX: f32 = 7.5;
     const CY: f32 = 8.0;
     const R: f32 = 4.8;
@@ -727,7 +735,7 @@ fn draw_power(p: &mut Rgba, x: f32, y: f32) {
     if (2.0..=5.0).contains(&y) {
         let a = cover((x - 7.5).abs(), 0.7);
         if a > 0.0 {
-            p.over(ICON_BLUE[0], ICON_BLUE[1], ICON_BLUE[2], a);
+            p.over(color[0], color[1], color[2], a);
         }
     }
     // 圆环(顶部 -90° ± 35° 开口,避开竖杆区域)
@@ -736,8 +744,13 @@ fn draw_power(p: &mut Rgba, x: f32, y: f32) {
     let in_gap = (ang + core::f32::consts::FRAC_PI_2).abs() < 35f32.to_radians();
     let a = cover((d - R).abs(), 0.6);
     if a > 0.0 && !in_gap {
-        p.over(ICON_BLUE[0], ICON_BLUE[1], ICON_BLUE[2], a);
+        p.over(color[0], color[1], color[2], a);
     }
+}
+
+/// 绘制电源按钮(品牌蓝):顶部开口圆环 + 竖直短杆
+fn draw_power(p: &mut Rgba, x: f32, y: f32) {
+    draw_power_color(p, x, y, ICON_BLUE);
 }
 
 /// 绘制滑杆:三条轨道 + 三个圆形滑块
@@ -792,6 +805,8 @@ fn menu_icon_pixel(kind: MenuIcon, x: f32, y: f32) -> (u8, u8, u8, u8) {
     match kind {
         MenuIcon::Language => draw_globe(&mut p, x, y),
         MenuIcon::Autostart => draw_power(&mut p, x, y),
+        MenuIcon::AutostartOn => draw_power_color(&mut p, x, y, ICON_ON),
+        MenuIcon::AutostartOff => draw_power_color(&mut p, x, y, ICON_OFF),
         MenuIcon::Options => draw_sliders(&mut p, x, y),
         MenuIcon::Exit => draw_exit(&mut p, x, y),
         MenuIcon::Clock => draw_clock(&mut p, x, y),
@@ -818,7 +833,7 @@ fn draw_menu_icon_pixels(kind: MenuIcon) -> Vec<u8> {
 }
 
 /// 菜单图标位图缓存(按 MenuIcon 顺序索引,0 = 未创建)
-static MENU_ICON_BITMAPS: Mutex<[usize; 6]> = Mutex::new([0; 6]);
+static MENU_ICON_BITMAPS: Mutex<[usize; 8]> = Mutex::new([0; 8]);
 
 /// 惰性创建并缓存指定菜单图标位图
 fn menu_icon_bitmap(kind: MenuIcon) -> HBITMAP {
@@ -870,7 +885,7 @@ fn destroy_menu_icon_bitmaps() {
 }
 
 /// 选项面板标签图标 HICON 缓存(按 MenuIcon 顺序索引,0 = 未创建)
-static PANEL_ICON_ICONS: Mutex<[usize; 6]> = Mutex::new([0; 6]);
+static PANEL_ICON_ICONS: Mutex<[usize; 8]> = Mutex::new([0; 8]);
 
 /// 惰性创建并缓存面板标签图标 HICON
 fn panel_icon_hicon(kind: MenuIcon) -> HICON {
@@ -2167,10 +2182,44 @@ mod menu_icon_tests {
 
     #[test]
     fn each_icon_bitmap_is_16x16_32bpp() {
-        for kind in [MenuIcon::Language, MenuIcon::Autostart, MenuIcon::Options, MenuIcon::Exit] {
+        for kind in [
+            MenuIcon::Language,
+            MenuIcon::Autostart,
+            MenuIcon::AutostartOn,
+            MenuIcon::AutostartOff,
+            MenuIcon::Options,
+            MenuIcon::Exit,
+        ] {
             let px = draw_menu_icon_pixels(kind);
             assert_eq!(px.len(), 16 * 16 * 4, "{kind:?} 尺寸应为 16x16x4");
         }
+    }
+
+    #[test]
+    fn autostart_on_green_off_red() {
+        let on = draw_menu_icon_pixels(MenuIcon::AutostartOn);
+        let off = draw_menu_icon_pixels(MenuIcon::AutostartOff);
+        // 右侧圆环像素(避开顶部开口)
+        let (b_on, g_on, r_on, a_on) = px(&on, 12, 8);
+        let (b_off, g_off, r_off, a_off) = px(&off, 12, 8);
+        assert!(a_on > 200, "启用电源圆环应不透明 alpha={a_on}");
+        assert!(a_off > 200, "关闭电源圆环应不透明 alpha={a_off}");
+        // 启用为绿调:绿通道最高
+        assert!(
+            g_on > r_on && g_on > b_on,
+            "启用图标应为绿调 g={g_on} r={r_on} b={b_on}"
+        );
+        // 关闭为红调:红通道最高
+        assert!(
+            r_off > g_off && r_off > b_off,
+            "关闭图标应为红调 r={r_off} g={g_off} b={b_off}"
+        );
+        // 两状态颜色必须可区分
+        assert_ne!(
+            (b_on, g_on, r_on),
+            (b_off, g_off, r_off),
+            "启停图标颜色应可区分"
+        );
     }
 
     #[test]
