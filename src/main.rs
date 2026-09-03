@@ -10,7 +10,9 @@
 
 mod caps;
 mod config;
+mod i18n;
 
+use i18n::Lang;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -19,6 +21,7 @@ use windows_sys::Win32::Foundation::{
     LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
 use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetDC, GetStockObject, GetTextExtentPoint32W, ReleaseDC, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, HBRUSH, HDC,
@@ -40,14 +43,15 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NIF_ICON, NIF_MESSAGE, NIF_TIP,
-    NIM_ADD, NIM_DELETE, NIM_SETVERSION, NOTIFYICON_VERSION_4,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
     GetForegroundWindow, GetWindowThreadProcessId,
     CreateIconFromResource, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_MULTILINE, ES_NUMBER,
-    ES_AUTOVSCROLL, ES_READONLY, ES_WANTRETURN, GetCursorPos,
+    ES_AUTOVSCROLL, ES_READONLY, ES_WANTRETURN, GetCursorPos, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
     GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW, GetSystemMetrics,
     GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, KillTimer,
     LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
@@ -59,7 +63,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON,
     TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, HWND_MESSAGE, HICON,
     IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MB_ICONERROR, MB_OK, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL,
+    WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
     WM_MOUSEMOVE,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
@@ -88,6 +93,10 @@ const ID_MENU_EXIT: usize = 1001;
 const ID_MENU_AUTOSTART: usize = 1002;
 /// 托盘菜单"选项"命令 ID
 const ID_MENU_OPTIONS: usize = 1003;
+/// 托盘菜单"语言:简体中文"命令 ID
+const ID_MENU_LANG_ZH: usize = 1004;
+/// 托盘菜单"语言:English"命令 ID
+const ID_MENU_LANG_EN: usize = 1005;
 /// 隐藏窗口类名
 const WINDOW_CLASS: &str = "CapIMESwitchTrayWindow";
 /// 单实例互斥体名(跨进程唯一)
@@ -112,11 +121,8 @@ const ID_OPT_HELP_EXCLUDE: usize = 2010;
 const ID_OPT_VERSION: usize = 2011;
 /// 说明栏控件 ID(面板底部只读文本,点击/悬浮问号时显示说明)
 const ID_OPT_HELP_BAR: usize = 2012;
-/// 说明文本(工具提示内容)
-const HELP_AUTOSTART: &str = "勾选后开机自动运行本程序,状态与托盘菜单一致,保存时生效";
-const HELP_DELAY: &str = "短按 CapsLock(未达该毫秒数松开)切换输入法;长按(达到该毫秒数)切换大小写";
-const HELP_EXCLUDE: &str =
-    "这些程序中 CapsLock 恢复原始行为,不切换输入法;多个程序用逗号或换行分隔";
+/// 选项面板语言下拉框 ID
+const ID_OPT_COMBO_LANGUAGE: usize = 2013;
 /// 静态控件样式(0.59 未导出 SS_* 常量:SS_CENTER=0x1 水平居中,
 /// SS_CENTERIMAGE=0x200 垂直居中,SS_NOTIFY=0x100 可收单击)
 const SS_CENTER: u32 = 0x0001;
@@ -135,12 +141,28 @@ static TIMER_ARMED: Mutex<bool> = Mutex::new(false);
 static LONG_PRESS_MS: Mutex<u32> = Mutex::new(config::DEFAULT_LONG_PRESS_MS);
 /// 排除程序列表(小写 exe 文件名):启动时从 config.toml 加载,保存设置后更新
 static EXCLUDE_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 当前界面语言:启动时从 config.toml 解析(默认跟随系统),切换后即时更新
+static LANGUAGE: Mutex<Lang> = Mutex::new(Lang::Zh);
 /// 选项面板是否打开(打开期间屏蔽托盘交互)
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
 /// 当前点击固定的问号控件 ID(说明栏保持显示);None 表示未固定
 static HELP_PINNED: Mutex<Option<usize>> = Mutex::new(None);
 /// Static 类原始窗口过程(问号图标的子类化链回目标)
 static ORIG_STATIC_PROC: AtomicUsize = AtomicUsize::new(0);
+/// 当前语言的全部用户可见字符串(锁在返回后立即释放,引用为 'static)
+fn tr() -> &'static i18n::Strings {
+    LANGUAGE.lock().strings()
+}
+
+/// 用参数按序替换模板中的 `{}`(模板来自 i18n 表,属运行期值,不能直接用 format!)
+fn tpl(template: &str, args: &[&dyn std::fmt::Display]) -> String {
+    let mut out = template.to_string();
+    for a in args {
+        out = out.replacen("{}", &a.to_string(), 1);
+    }
+    out
+}
+
 /// 隐藏窗口句柄(托盘回调路由),存位模式以保持 static Sync
 static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
 /// TaskbarCreated 动态消息号(资源管理器重启后重建图标)
@@ -207,18 +229,25 @@ fn main() {
             env!("CARGO_PKG_VERSION"),
             std::env::current_exe().unwrap_or_default()
         ));
+        // 尽早加载持久化设置(缺失或损坏时保持默认值),让后续错误提示使用正确语言
+        if let Some(path) = config_path() {
+            let cfg = config::load(&path);
+            *LONG_PRESS_MS.lock() = cfg.long_press_ms;
+            *EXCLUDE_PROCESSES.lock() = cfg.exclude_processes;
+            *LANGUAGE.lock() = resolve_language(&cfg.language);
+        }
         // 单实例:命名互斥体跨进程唯一(类名仅进程内有效,不能用于跨进程检测)
         let mutex_name = to_utf16(SINGLE_INSTANCE_NAME);
         let instance_mutex = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
         if instance_mutex.is_null() {
             let err = GetLastError();
             log_write(&format!("创建实例锁失败 GetLastError={err}"));
-            show_error("创建实例锁失败");
+            show_error(tr().err_instance_lock);
             return;
         }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             log_write("检测到已有实例,退出");
-            show_error("CapIMESwitch 已在运行中,请从系统托盘操作。");
+            show_error(tr().err_already_running);
             return;
         }
         // 句柄保持存活至进程退出(进程结束自动释放,无需 CloseHandle)
@@ -228,14 +257,14 @@ fn main() {
         if !register_window_class(hmod) {
             let err = GetLastError();
             log_write(&format!("注册主窗口类失败 GetLastError={err}"));
-            show_error(&format!("注册窗口类失败, GetLastError={err}"));
+            show_error(&tpl(tr().err_register_class, &[&err]));
             return;
         }
         log_write("主窗口类注册成功");
         if !register_options_window_class(hmod) {
             let err = GetLastError();
             log_write(&format!("注册选项面板窗口类失败 GetLastError={err}"));
-            show_error(&format!("注册选项窗口类失败, GetLastError={err}"));
+            show_error(&tpl(tr().err_register_options_class, &[&err]));
             return;
         }
         log_write("选项面板窗口类注册成功");
@@ -244,7 +273,7 @@ fn main() {
         if hwnd.is_null() {
             let err = GetLastError();
             log_write(&format!("创建托盘窗口失败 GetLastError={err}"));
-            show_error("创建托盘窗口失败");
+            show_error(tr().err_create_tray_window);
             return;
         }
         TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
@@ -260,23 +289,16 @@ fn main() {
         if !add_tray_icon(hwnd) {
             let err = GetLastError();
             log_write(&format!("添加托盘图标失败 GetLastError={err}"));
-            show_error("添加托盘图标失败");
+            show_error(tr().err_add_tray_icon);
             return;
         }
         log_write("托盘图标添加成功");
-
-        // 加载持久化设置(缺失或损坏时保持默认值)
-        if let Some(path) = config_path() {
-            let cfg = config::load(&path);
-            *LONG_PRESS_MS.lock() = cfg.long_press_ms;
-            *EXCLUDE_PROCESSES.lock() = cfg.exclude_processes;
-        }
 
         let hook: HHOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0);
         if hook.is_null() {
             let err = GetLastError();
             log_write(&format!("安装键盘钩子失败 GetLastError={err}"));
-            show_error(&format!("安装键盘钩子失败, GetLastError={err}"));
+            show_error(&tpl(tr().err_install_hook, &[&err]));
             return;
         }
         log_write("键盘钩子安装成功,进入消息循环");
@@ -389,7 +411,7 @@ unsafe fn add_tray_icon(hwnd: HWND) -> bool {
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = load_app_icon().unwrap_or_else(|| unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) });
-    set_utf16(&mut nid.szTip, "CapIMESwitch - CapsLock 智能切换");
+    set_utf16(&mut nid.szTip, tr().tray_tooltip);
     let ok = Shell_NotifyIconW(NIM_ADD, &nid) != 0;
     if ok {
         nid.Anonymous = NOTIFYICONDATAW_0 {
@@ -409,23 +431,46 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
     Shell_NotifyIconW(NIM_DELETE, &nid);
 }
 
-/// 托盘右键菜单:开机启动(带勾选标记)+ 退出
+/// 托盘右键菜单:开机启动(带勾选标记)+ 选项 + 语言子菜单 + 退出
 unsafe fn show_tray_menu(hwnd: HWND) {
     SetForegroundWindow(hwnd);
     let menu = CreatePopupMenu();
+    let strings = tr();
 
     // 开机启动:根据注册表当前状态显示勾选
     let auto_start = is_autostart_enabled();
-    let autostart_label = to_utf16("开机启动");
+    let autostart_label = to_utf16(strings.menu_autostart);
     let autostart_flags = MF_STRING | if auto_start { MF_CHECKED } else { 0 };
     AppendMenuW(menu, autostart_flags, ID_MENU_AUTOSTART, autostart_label.as_ptr());
 
-    let options_label = to_utf16("选项");
+    let options_label = to_utf16(strings.menu_options);
     AppendMenuW(menu, MF_STRING, ID_MENU_OPTIONS, options_label.as_ptr());
 
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
-    let exit_label = to_utf16("退出");
+    // 语言子菜单:各语言带互斥勾选,选项显示母语名
+    let lang_menu = CreatePopupMenu();
+    let cur_lang = *LANGUAGE.lock();
+    let zh_label = to_utf16(strings.lang_zh);
+    let en_label = to_utf16(strings.lang_en);
+    AppendMenuW(
+        lang_menu,
+        MF_STRING | if cur_lang == Lang::Zh { MF_CHECKED } else { 0 },
+        ID_MENU_LANG_ZH,
+        zh_label.as_ptr(),
+    );
+    AppendMenuW(
+        lang_menu,
+        MF_STRING | if cur_lang == Lang::En { MF_CHECKED } else { 0 },
+        ID_MENU_LANG_EN,
+        en_label.as_ptr(),
+    );
+    let lang_label = to_utf16(strings.menu_language);
+    AppendMenuW(menu, MF_POPUP, lang_menu as usize, lang_label.as_ptr());
+
+    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+
+    let exit_label = to_utf16(strings.menu_exit);
     AppendMenuW(menu, MF_STRING, ID_MENU_EXIT, exit_label.as_ptr());
 
     let mut pt = POINT { x: 0, y: 0 };
@@ -445,15 +490,76 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     match cmd as usize {
         ID_MENU_AUTOSTART => {
             if !toggle_autostart() {
-                show_error("修改开机自启动设置失败");
+                show_error(tr().err_toggle_autostart);
             }
         }
         ID_MENU_OPTIONS => open_options_panel(hwnd),
+        ID_MENU_LANG_ZH => set_language(Lang::Zh),
+        ID_MENU_LANG_EN => set_language(Lang::En),
         ID_MENU_EXIT => PostQuitMessage(0),
         _ => {}
     }
     // 让菜单正确关闭的标准做法
     PostMessageW(hwnd, WM_NULL, 0, 0);
+}
+
+// ---------- 语言(i18n) ----------
+
+/// 解析配置中的语言值:zh/en 直接使用;auto 与未知值按系统 UI 语言解析
+fn resolve_language(cfg_lang: &str) -> Lang {
+    match Lang::parse(cfg_lang) {
+        Some(l) => l,
+        None => system_language(),
+    }
+}
+
+/// 系统 UI 语言:按 LCID 主语言映射 zh/en,未知回退中文
+fn system_language() -> Lang {
+    lang_from_lcid(unsafe { GetUserDefaultUILanguage() })
+}
+
+/// 按 LCID 主语言(低 10 位)映射语言:0x04 中文系 / 0x09 英文系,其余回退中文
+fn lang_from_lcid(lcid: u16) -> Lang {
+    match lcid & 0x3FF {
+        0x04 => Lang::Zh, // 中文系(zh-CN/HK/TW/SG/MO)
+        0x09 => Lang::En, // 英文系
+        _ => Lang::Zh,    // 未知语言回退中文
+    }
+}
+
+/// 切换运行语言:更新全局状态、托盘 tooltip,并持久化到 config.toml(language 字段)
+fn set_language(lang: Lang) {
+    {
+        let mut cur = LANGUAGE.lock();
+        if *cur == lang {
+            return;
+        }
+        *cur = lang;
+    }
+    log_write(&format!("切换语言: {}", lang.code()));
+    unsafe { update_tray_tooltip() };
+    if let Some(path) = config_path() {
+        let mut cfg = config::load(&path);
+        cfg.language = lang.code().to_string();
+        if !config::save(&cfg, &path) {
+            log_write("保存语言设置失败");
+        }
+    }
+}
+
+/// 刷新托盘 tooltip(语言切换后即时生效)
+unsafe fn update_tray_tooltip() {
+    let hwnd = TRAY_HWND.load(Ordering::Relaxed) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+    nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+    nid.hWnd = hwnd;
+    nid.uID = TRAY_ICON_ID;
+    nid.uFlags = NIF_TIP;
+    set_utf16(&mut nid.szTip, tr().tray_tooltip);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 // ---------- 注册表通用读写(参数化,便于测试) ----------
@@ -672,9 +778,9 @@ unsafe fn open_options_panel(owner: HWND) {
     }
     let hmod = GetModuleHandleW(std::ptr::null::<u16>());
     let class_name = to_utf16(OPTIONS_WINDOW_CLASS);
-    let title = to_utf16("CapIMESwitch 选项");
+    let title = to_utf16(tr().panel_title);
     const W: i32 = 440;
-    const H: i32 = 300;
+    const H: i32 = 330;
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let hwnd = CreateWindowExW(
@@ -692,7 +798,7 @@ unsafe fn open_options_panel(owner: HWND) {
         std::ptr::null_mut(),
     );
     if hwnd.is_null() {
-        show_error(&format!("创建选项窗口失败, GetLastError={}", GetLastError()));
+        show_error(&tpl(tr().err_create_options_window, &[&GetLastError()]));
         return;
     }
     OPTIONS_OPEN.store(true, Ordering::Relaxed);
@@ -744,10 +850,11 @@ unsafe fn create_help_icon(
 
 /// 在说明栏显示指定问号的说明文本(其他问号文本互斥,直接覆盖)
 unsafe fn show_help_bar(parent: HWND, ctrl_id: usize) {
+    let strings = tr();
     let text = match ctrl_id {
-        ID_OPT_HELP_AUTOSTART => HELP_AUTOSTART,
-        ID_OPT_HELP_DELAY => HELP_DELAY,
-        ID_OPT_HELP_EXCLUDE => HELP_EXCLUDE,
+        ID_OPT_HELP_AUTOSTART => strings.help_autostart,
+        ID_OPT_HELP_DELAY => strings.help_delay,
+        ID_OPT_HELP_EXCLUDE => strings.help_exclude,
         _ => return,
     };
     let bar = GetDlgItem(parent, ID_OPT_HELP_BAR as i32);
@@ -834,13 +941,20 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     let button_class = to_utf16("Button");
     let edit_class = to_utf16("Edit");
     let static_class = to_utf16("Static");
+    let combo_class = to_utf16("ComboBox");
+    let strings = tr();
 
     // 运行时测量最宽标题的像素宽度(按实际字体/DPI),左侧列宽随内容而定
     let dc = GetDC(parent);
     let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
     let mut text_size: SIZE = std::mem::zeroed();
     let mut max_label = 0i32;
-    for title in ["开机启动", "长按延迟(毫秒)", "排除程序"] {
+    for title in [
+        strings.label_autostart,
+        strings.label_delay,
+        strings.label_exclude,
+        strings.label_language,
+    ] {
         let w = to_utf16(title);
         if GetTextExtentPoint32W(
             dc,
@@ -875,7 +989,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     ));
 
     // 行 1:名称(左对齐)+ 问号 + 无字勾选框
-    let check_label = to_utf16("开机启动");
+    let check_label = to_utf16(strings.label_autostart);
     let label1 = CreateWindowExW(
         0,
         static_class.as_ptr(),
@@ -923,7 +1037,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     }
 
     // 行 2:名称(左对齐)+ 问号 + 延迟输入框
-    let label_text = to_utf16("长按延迟(毫秒)");
+    let label_text = to_utf16(strings.label_delay);
     let label = CreateWindowExW(
         0,
         static_class.as_ptr(),
@@ -968,7 +1082,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     }
 
     // 行 3:名称(左对齐)+ 问号 + 排除程序多行输入框
-    let exclude_label_text = to_utf16("排除程序");
+    let exclude_label_text = to_utf16(strings.label_exclude);
     let label3 = CreateWindowExW(
         0,
         static_class.as_ptr(),
@@ -1018,6 +1132,56 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(edit2);
     }
 
+    // 行 4:名称(左对齐)+ 语言下拉框(选项显示母语名,选中项即当前语言)
+    let lang_label_text = to_utf16(strings.label_language);
+    let label4 = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        lang_label_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        16,
+        166,
+        max_label,
+        20,
+        parent,
+        std::ptr::null_mut(),
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !label4.is_null() {
+        set_control_font(label4);
+    }
+
+    let combo = CreateWindowExW(
+        0,
+        combo_class.as_ptr(),
+        std::ptr::null(),
+        // CBS_DROPDOWNLIST + CBS_HASSTRINGS:下拉列表由控件自存字符串并绘制
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32 | CBS_HASSTRINGS as u32
+            | WS_VSCROLL as u32,
+        right_x,
+        164,
+        right_w,
+        200,
+        parent,
+        (ID_OPT_COMBO_LANGUAGE as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !combo.is_null() {
+        set_control_font(combo);
+        let cur_lang = *LANGUAGE.lock();
+        let mut select_idx = 0usize;
+        for (i, lang) in Lang::all().iter().enumerate() {
+            let item = to_utf16(lang.display_name());
+            SendMessageW(combo, CB_ADDSTRING, i as WPARAM, item.as_ptr() as LPARAM);
+            if *lang == cur_lang {
+                select_idx = i;
+            }
+        }
+        SendMessageW(combo, CB_SETCURSEL, select_idx as WPARAM, 0 as LPARAM);
+    }
+
     // 说明栏:只读多行文本,点击/悬浮问号时在此显示对应说明,默认隐藏
     let bar = CreateWindowExW(
         0,
@@ -1025,7 +1189,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         std::ptr::null(),
         WS_CHILD | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
         16,
-        166,
+        212,
         408,
         40,
         parent,
@@ -1039,14 +1203,14 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     }
 
     // 版本号:底部左侧灰色小字(env! 与 Cargo.toml 同步)
-    let ver_text = to_utf16(&format!("版本 {}", env!("CARGO_PKG_VERSION")));
+    let ver_text = to_utf16(&tpl(strings.version_template, &[&env!("CARGO_PKG_VERSION")]));
     let ver = CreateWindowExW(
         0,
         static_class.as_ptr(),
         ver_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         16,
-        219,
+        268,
         200,
         20,
         parent,
@@ -1059,14 +1223,14 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     }
 
     // 保存按钮(右下角,右/下边距 24)
-    let save_label = to_utf16("保存");
+    let save_label = to_utf16(strings.save);
     let save = CreateWindowExW(
         0,
         button_class.as_ptr(),
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         client_w - 24 - 80,
-        212,
+        262,
         80,
         28,
         parent,
@@ -1138,9 +1302,9 @@ unsafe fn save_options(hwnd: HWND) {
     let ms = match parse_long_press_ms(&text) {
         Some(v) => v,
         None => {
-            show_error(&format!(
-                "请输入 {} - {} 之间的毫秒数",
-                config::MIN_LONG_PRESS_MS, config::MAX_LONG_PRESS_MS
+            show_error(&tpl(
+                tr().err_delay_range,
+                &[&config::MIN_LONG_PRESS_MS, &config::MAX_LONG_PRESS_MS],
             ));
             return;
         }
@@ -1148,7 +1312,7 @@ unsafe fn save_options(hwnd: HWND) {
     let path = match config_path() {
         Some(p) => p,
         None => {
-            show_error("无法确定配置文件位置");
+            show_error(tr().err_config_path);
             return;
         }
     };
@@ -1159,18 +1323,28 @@ unsafe fn save_options(hwnd: HWND) {
         String::from_utf16_lossy(&buf[..len.max(0) as usize])
     };
     let exclude = config::parse_exclude_list(&exclude_text);
+    // 语言下拉框:按 Lang::all() 顺序映射选中索引
+    let combo = GetDlgItem(hwnd, ID_OPT_COMBO_LANGUAGE as i32);
+    let sel = SendMessageW(combo, CB_GETCURSEL, 0, 0) as usize;
+    let lang = Lang::all().get(sel).copied().unwrap_or(Lang::Zh);
     let cfg = config::Config {
         long_press_ms: ms,
         exclude_processes: exclude.clone(),
+        language: lang.code().to_string(),
     };
     if !config::save(&cfg, &path) {
         log_write("保存 config.toml 失败");
-        show_error("保存设置失败");
+        show_error(tr().err_save_failed);
         return;
     }
-    log_write(&format!("保存设置: 延迟={ms}ms 排除={exclude:?}"));
+    log_write(&format!(
+        "保存设置: 延迟={ms}ms 排除={exclude:?} 语言={}",
+        lang.code()
+    ));
     *LONG_PRESS_MS.lock() = ms;
     *EXCLUDE_PROCESSES.lock() = exclude;
+    *LANGUAGE.lock() = lang;
+    update_tray_tooltip();
 
     // 开机启动:勾选与当前注册表一致则跳过,否则写入或删除
     let check = GetDlgItem(hwnd, ID_OPT_CHECK_AUTOSTART as i32);
@@ -1189,7 +1363,7 @@ unsafe fn save_options(hwnd: HWND) {
         };
     if !ok {
         log_write("保存开机自启动设置失败");
-        show_error("保存开机自启动设置失败");
+        show_error(tr().err_save_autostart);
         return;
     }
     DestroyWindow(hwnd);
@@ -1537,5 +1711,34 @@ mod registry_tests {
         assert_eq!(parse_long_press_ms("-1"), None);
         assert_eq!(parse_long_press_ms("0"), None);
         assert_eq!(parse_long_press_ms("500.5"), None);
+    }
+}
+
+#[cfg(test)]
+mod lang_tests {
+    use super::*;
+
+    #[test]
+    fn lcid_maps_chinese_variants_to_zh() {
+        // zh-CN / zh-TW / zh-HK / zh-SG / zh-MO 主语言均为 0x04
+        for lcid in [0x0804u16, 0x0404, 0x0C04, 0x1004, 0x1404] {
+            assert_eq!(lang_from_lcid(lcid), Lang::Zh, "lcid=0x{lcid:04X}");
+        }
+    }
+
+    #[test]
+    fn lcid_maps_english_variants_to_en() {
+        // en-US / en-GB / en-CA / en-AU / en-NZ 主语言均为 0x09
+        for lcid in [0x0409u16, 0x0809, 0x1009, 0x0C09, 0x1409] {
+            assert_eq!(lang_from_lcid(lcid), Lang::En, "lcid=0x{lcid:04X}");
+        }
+    }
+
+    #[test]
+    fn unknown_lcid_falls_back_to_zh() {
+        // 日语/法语/德语等未知语言回退中文
+        assert_eq!(lang_from_lcid(0x0411), Lang::Zh); // ja-JP
+        assert_eq!(lang_from_lcid(0x040C), Lang::Zh); // fr-FR
+        assert_eq!(lang_from_lcid(0x0407), Lang::Zh); // de-DE
     }
 }

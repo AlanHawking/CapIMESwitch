@@ -61,7 +61,7 @@ powershell -ExecutionPolicy Bypass -File smoke.ps1
 | `build.rs` | 程序化生成多尺寸 ICO 并嵌入 exe 资源(失败仅告警,不致命) | ✅ 入库 |
 | `installer/setup.iss` | Inno Setup 安装脚本(`SetupIconFile=app.ico`,打包 `target/release` 下的 exe) | ✅ 入库 |
 | `installer/ChineseSimplified.isl` | 简体中文语言包,Setup 编译时合并 | ✅ 入库 |
-| `installer/app.ico` | 安装器界面图标;按 `.gitignore` 约定为构建期生成物,克隆后缺失时需自行提供(可从 `OUT_DIR/icon.ico` 提取) | ⚠️ 不入库 |
+|`installer/app.ico`|安装器界面图标,由 build.rs 生成后复制入库;图标设计变更时需重新从 `OUT_DIR/icon.ico` 提取并更新|✅ 入库|
 | `installer/dist/` | 安装包输出目录 | ❌ gitignore |
 | `/target` | cargo 构建产物 | ❌ gitignore |
 

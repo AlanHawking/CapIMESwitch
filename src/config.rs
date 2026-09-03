@@ -13,6 +13,8 @@ pub const DEFAULT_LONG_PRESS_MS: u32 = 500;
 /// 长按判定阈值允许范围
 pub const MIN_LONG_PRESS_MS: u32 = 100;
 pub const MAX_LONG_PRESS_MS: u32 = 5000;
+/// 语言偏好默认值(跟随系统 UI 语言)
+pub const DEFAULT_LANGUAGE: &str = "auto";
 
 /// 应用配置
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,10 +25,17 @@ pub struct Config {
     /// 排除程序列表(exe 文件名,小写):在这些程序中 CapsLock 恢复原始行为
     #[serde(default)]
     pub exclude_processes: Vec<String>,
+    /// 语言偏好:auto(跟随系统 UI 语言)/zh/en;缺失或非法回退 auto
+    #[serde(default = "default_language")]
+    pub language: String,
 }
 
 fn default_long_press_ms() -> u32 {
     DEFAULT_LONG_PRESS_MS
+}
+
+fn default_language() -> String {
+    DEFAULT_LANGUAGE.to_string()
 }
 
 impl Default for Config {
@@ -34,6 +43,7 @@ impl Default for Config {
         Self {
             long_press_ms: DEFAULT_LONG_PRESS_MS,
             exclude_processes: Vec::new(),
+            language: DEFAULT_LANGUAGE.to_string(),
         }
     }
 }
@@ -46,6 +56,8 @@ impl Config {
         }
         // 统一 trim + 转小写 + 去空项,保证与 UI 保存时写入的格式一致
         self.exclude_processes = parse_exclude_list(&self.exclude_processes.join(","));
+        // 语言值仅保留 auto/zh/en,其余回退 auto
+        self.language = crate::i18n::normalize_language(&self.language);
         self
     }
 }
@@ -105,9 +117,31 @@ mod tests {
         let cfg = Config {
             long_press_ms: 800,
             exclude_processes: vec!["a.exe".to_string(), "b.exe".to_string()],
+            language: "en".to_string(),
         };
         assert!(save(&cfg, &p));
         assert_eq!(load(&p), cfg);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn language_defaults_to_auto() {
+        let p = temp_path("lang");
+        let _ = fs::remove_file(&p);
+        fs::write(&p, "long_press_ms = 600\n").unwrap();
+        let cfg = load(&p);
+        assert_eq!(cfg.language, "auto");
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn invalid_language_falls_back_to_auto() {
+        let p = temp_path("langbad");
+        let _ = fs::remove_file(&p);
+        fs::write(&p, "language = \"fr\"\n").unwrap();
+        assert_eq!(load(&p).language, "auto");
+        fs::write(&p, "language = \"zh\"\n").unwrap();
+        assert_eq!(load(&p).language, "zh");
         let _ = fs::remove_file(&p);
     }
 
@@ -179,9 +213,21 @@ mod tests {
         let cfg = Config {
             long_press_ms: 500,
             exclude_processes: vec![" Notepad.EXE ".to_string()],
+            language: "auto".to_string(),
         };
         let cfg = cfg.sanitized();
         assert_eq!(cfg.exclude_processes, vec!["notepad.exe".to_string()]);
         assert_eq!(cfg.long_press_ms, 500);
+        assert_eq!(cfg.language, "auto");
+    }
+
+    #[test]
+    fn sanitized_normalizes_invalid_language() {
+        let cfg = Config {
+            long_press_ms: 500,
+            exclude_processes: Vec::new(),
+            language: "fr".to_string(),
+        };
+        assert_eq!(cfg.sanitized().language, "auto");
     }
 }
