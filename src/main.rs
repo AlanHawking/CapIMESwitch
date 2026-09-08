@@ -42,6 +42,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
     KEYEVENTF_KEYUP, VK_CAPITAL, VK_LWIN, VK_SPACE,
 };
+use windows_sys::Win32::UI::HiDpi::{
+    GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NIF_ICON, NIF_MESSAGE, NIF_TIP,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
@@ -56,9 +59,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
     GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW, GetSystemMetrics,
     GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, KillTimer,
-    LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    LoadIconW, LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
     SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
+    IMAGE_ICON, LR_DEFAULTCOLOR,
     SW_HIDE, SW_SHOW, TrackPopupMenu,
     CallWindowProcW, WS_EX_CLIENTEDGE, ICON_BIG,
     ICON_SMALL,
@@ -173,25 +177,23 @@ static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
 /// TaskbarCreated 动态消息号(资源管理器重启后重建图标)
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
-/// 从嵌入 ICO 中解析最大尺寸的图像数据(BITMAPINFOHEADER 起始偏移与长度)
-///
-/// ICO 文件头之后可能含多个尺寸(16/32/48),CreateIconFromResource
-/// 需要单个图像目录条目对应的数据。返回尺寸最大的那个。
-fn ico_largest_image(data: &[u8]) -> Option<(*const u8, u32)> {
+
+/// 从 ICO 中挑选与目标尺寸最接近的原生图像条目,使其能被"原样"给定或最小缩放。
+/// 保证托盘/窗口在当前 DPI 下命中精确像素尺寸,避免 shell 缩放引入模糊与色偏。
+fn ico_for_size(data: &[u8], target: u32) -> Option<(*const u8, u32)> {
     if data.len() < 6 {
         return None;
     }
-    // ICONDIR: reserved(2) | type(2) | count(2)
     let count = u16::from_le_bytes([data[4], data[5]]) as usize;
-    let mut best: Option<(usize, usize, u32)> = None; // (尺寸, offset, length)
+    let mut best: Option<(u32, usize, u32)> = None; // (距离, offset, length)
     for i in 0..count {
         let entry = 6 + i * 16;
         if entry + 16 > data.len() {
             break;
         }
-        let width = data[entry] as usize; // 0 表示 256
+        let width = data[entry] as usize;
         let height = data[entry + 1] as usize;
-        let size = if width == 0 { 256 } else { width.max(height) };
+        let size = if width == 0 { 256 } else { width.max(height) as u32 };
         let len = u32::from_le_bytes([
             data[entry + 8],
             data[entry + 9],
@@ -204,31 +206,73 @@ fn ico_largest_image(data: &[u8]) -> Option<(*const u8, u32)> {
             data[entry + 14],
             data[entry + 15],
         ]) as usize;
-        if off + len <= data.len() && best.is_none_or(|(bs, _, _)| size > bs) {
-            best = Some((size, off, len as u32));
+        if off + len <= data.len() {
+            let dist = size.abs_diff(target);
+            if best.is_none_or(|(d, _, _)| dist < d) {
+                best = Some((dist, off, len as u32));
+            }
         }
     }
     best.map(|(_, off, len)| unsafe { (data.as_ptr().add(off), len) })
 }
 
-/// 从嵌入字节加载自绘图标(仅加载一次,失败返回 None 由调用方兜底)
+/// 从嵌入资源加载应用图标(仅加载一次,失败返回 None 由调用方兜底)。
+/// 按系统 DPI 计算托盘目标像素(16px@100%; 125%→20px; 150%→24px),优先从 exe 资源
+/// `LoadImageW` 加载(与多数第三方应用一致,便于 26H1 浮出层正确处理),失败回退内存解析。
 fn load_app_icon() -> Option<HICON> {
     let cached = APP_ICON.load(Ordering::Relaxed);
     if cached != 0 {
         return Some(cached as HICON);
     }
-    let icon = ico_largest_image(APP_ICON_BYTES).and_then(|(ptr, len)| unsafe {
-        let icon = CreateIconFromResource(ptr, len, 1, 0x00030000);
-        (!icon.is_null()).then_some(icon)
-    });
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
+    let target = ((16u32 * dpi + 48) / 96).min(256);
+    let icon = match icon_from_resource(target) {
+        Some(h) => {
+            log_write(&format!("托盘图标:从 exe 资源加载 {target}px"));
+            Some(h)
+        }
+        None => {
+            let err = unsafe { GetLastError() };
+            log_write(&format!("托盘图标:资源加载失败(GetLastError={err}),回退内存解析 {target}px"));
+            ico_for_size(APP_ICON_BYTES, target).and_then(|(ptr, len)| unsafe {
+                let icon = CreateIconFromResource(ptr, len, 1, 0x00030000);
+                (!icon.is_null()).then_some(icon)
+            })
+        }
+    };
     if let Some(h) = icon {
         APP_ICON.store(h as usize, Ordering::Relaxed);
     }
     icon
 }
 
+/// 从 exe 资源加载应用图标。build.rs 的 winres 将自定义图标以资源 name=1 嵌入,
+/// 这里按目标尺寸取最匹配的原生分辨率,尽可能免于系统缩放。
+fn icon_from_resource(target: u32) -> Option<HICON> {
+    let hmod = unsafe { GetModuleHandleW(std::ptr::null::<u16>()) };
+    if hmod.is_null() {
+        return None;
+    }
+    let raw = unsafe {
+        LoadImageW(
+            hmod,
+            1 as *const u16,
+            IMAGE_ICON,
+            target as i32,
+            target as i32,
+            LR_DEFAULTCOLOR,
+        )
+    };
+    let icon = raw as HICON;
+    (!icon.is_null()).then_some(icon)
+}
+
 fn main() {
     unsafe {
+        // 声明 Per-Monitor V2 DPI 感知。进程默认 DPI-unaware,托盘图标会被 26H1 走
+        // 系统 DPI 虚拟化/位图拉伸路径合成(表现为红底+模糊、悬停重绘恢复);
+        // PMv2 后 shell 用当前 DPI 高清路径渲染。必须在任何窗口创建前调用。
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         log_write(&format!(
             "CapIMESwitch v{} 启动 exe={:?}",
             env!("CARGO_PKG_VERSION"),
@@ -646,11 +690,16 @@ impl Rgba {
     }
 
     fn to_bgra(self) -> (u8, u8, u8, u8) {
+        // 预乘 alpha:Win32 UI 位图(菜单 MIIM_BITMAP / CreateIconIndirect 颜色位图 /
+        // AlphaBlend)的 32bpp 合成一律假定预乘。此前输出直通 alpha,半透明像素
+        // 被当预乘解读导致颜色溢出饱和——26H1 XAML 菜单下表现为蓝图标泛红边。
+        // a=1 时预乘与直通等价,不透明区域(如退出 X)不受影响。
+        let a = self.a;
         (
-            (self.b * 255.0).round() as u8,
-            (self.g * 255.0).round() as u8,
-            (self.r * 255.0).round() as u8,
-            (self.a * 255.0).round() as u8,
+            (self.b * a * 255.0).round() as u8,
+            (self.g * a * 255.0).round() as u8,
+            (self.r * a * 255.0).round() as u8,
+            (a * 255.0).round() as u8,
         )
     }
 }
@@ -2026,17 +2075,17 @@ mod icon_tests {
     use super::*;
 
     #[test]
-    fn ico_parses_largest_image() {
-        // 构建期 ICO 已知布局:3 条目,16/32/48(最大 48x48:offset=5446,len=9640)
-        let (ptr, len) = ico_largest_image(APP_ICON_BYTES).expect("应能解析 ico");
+    fn ico_parses_target_image() {
+        // 构建期 ICO 已知布局:6 条目 16/20/24/32/48/256,16px 为首(offset=102,len=1128)
+        let (ptr, len) = ico_for_size(APP_ICON_BYTES, 16).expect("应能解析 ico");
         let off = unsafe { ptr.offset_from(APP_ICON_BYTES.as_ptr()) } as usize;
-        assert_eq!(off, 5446);
-        assert_eq!(len, 9640);
+        assert_eq!(off, 102);
+        assert_eq!(len, 1128);
         assert!(off + len as usize <= APP_ICON_BYTES.len());
     }
 
     #[test]
-    fn ico_picks_largest_entry() {
+    fn ico_picks_nearest_size() {
         // 构造内存 ICO:16x16 在前,32x32 在后
         let mut ico = Vec::new();
         ico.extend_from_slice(&[0, 0, 1, 0, 2, 0]);
@@ -2053,7 +2102,13 @@ mod icon_tests {
             body_offsets.push(22 + entry);
         }
         ico.extend(std::iter::repeat_n(0u8, body_offsets[1] + 200));
-        let (ptr, len) = ico_largest_image(&ico).expect("应能解析");
+        // 目标 16 → 命中 16x16
+        let (ptr, len) = ico_for_size(&ico, 16).expect("应能解析");
+        let off = unsafe { ptr.offset_from(ico.as_ptr()) } as usize;
+        assert_eq!(off, body_offsets[0], "应选中 16x16");
+        assert_eq!(len, 100);
+        // 目标 32 → 命中 32x32
+        let (ptr, len) = ico_for_size(&ico, 32).expect("应能解析");
         let off = unsafe { ptr.offset_from(ico.as_ptr()) } as usize;
         assert_eq!(off, body_offsets[1], "应选中 32x32");
         assert_eq!(len, 200);
@@ -2281,5 +2336,34 @@ mod menu_icon_tests {
         assert!(a_ring > 100, "禁止圆环应存在 alpha={a_ring}");
         let (_, _, _, a_slash) = px(&bmp, 7, 8);
         assert!(a_slash > 150, "禁止斜杠应存在 alpha={a_slash}");
+    }
+
+    #[test]
+    fn menu_icon_pixels_are_premultiplied() {
+        // 预乘不变式:任一颜色通道 <= alpha。直通 alpha 会违反(如 b=255,a=128),
+        // 半透明像素被 Win32 菜单当预乘解读导致颜色溢出(26H1 表现为蓝图标红边)。
+        for kind in [
+            MenuIcon::Language,
+            MenuIcon::Autostart,
+            MenuIcon::AutostartOn,
+            MenuIcon::AutostartOff,
+            MenuIcon::Options,
+            MenuIcon::Exit,
+            MenuIcon::Clock,
+            MenuIcon::Blocked,
+        ] {
+            let bmp = draw_menu_icon_pixels(kind);
+            for i in (0..bmp.len()).step_by(4) {
+                let (b, g, r, a) = (bmp[i], bmp[i + 1], bmp[i + 2], bmp[i + 3]);
+                assert!(
+                    b <= a && g <= a && r <= a,
+                    "{kind:?} 像素#{i} 未预乘: b={b} g={g} r={r} a={a}"
+                );
+            }
+        }
+        // 防退化:地球图标须真的含半透明像素(细线/高光),否则上述不变式空转
+        let globe = draw_menu_icon_pixels(MenuIcon::Language);
+        let has_semi = globe.chunks(4).any(|px| px[3] > 0 && px[3] < 255);
+        assert!(has_semi, "地球图标应含半透明像素");
     }
 }

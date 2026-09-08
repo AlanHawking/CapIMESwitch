@@ -2,16 +2,16 @@
 //!
 //! 设计:圆角矩形背景 + 蓝色垂直渐变 + 白色 "C" 字形
 //! (CapsLock 首字母)+ 底部输入光标下划线。输出多尺寸 ICO
-//! (16/32/48),写入 OUT_DIR/icon.ico。
+//! (16/20/24/32/48/256),写入 OUT_DIR/icon.ico。包含 20/24 覆盖 125%/150%
+//! DPI 下托盘原始像素,256 供高 DPI 高质量缩放。
 
 use std::path::PathBuf;
 
 fn main() {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let ico = build_ico(&[16, 32, 48]);
+    let ico = build_ico(&[16, 20, 24, 32, 48, 256]);
     let ico_path = out.join("icon.ico");
     std::fs::write(&ico_path, &ico).expect("write icon.ico");
-
     // 将图标嵌入 exe 资源(任务栏/快捷方式/资源管理器显示),失败不致命
     let mut res = winres::WindowsResource::new();
     if res
@@ -106,20 +106,29 @@ fn pixel(x: u32, y: u32, size: u32, gx: u32, gy: u32, scale: u32) -> [u8; 4] {
     let s = size as f32;
     let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
 
-    // 圆角矩形:四角半径 r
-    let r = s * 0.18;
-    let cx = fx.clamp(r, s - r);
-    let cy = fy.clamp(r, s - r);
-    let (dx, dy) = (fx - cx, fy - cy);
-    if dx * dx + dy * dy > r * r {
-        return [0, 0, 0, 0]; // 圆角外:透明
-    }
-
-    // 垂直渐变:顶部亮蓝 → 底部深蓝
+    // 垂直渐变:顶部亮蓝 → 底部深蓝(先算,圆角透明像素也用同色 RGB)
     let t = fy / s;
     let r_ch = lerp(0x2D, 0x0F, t);
     let g_ch = lerp(0x9E, 0x63, t);
     let b_ch = lerp(0xFF, 0xE5, t);
+
+    // 圆角矩形:四角半径 r,边缘 1px 抗锯齿过渡。
+    // 透明像素 RGB 必须保留渐变色而非置黑:shell 缩放插值出的中间 alpha 像素
+    // 两侧颜色一致,即使 26H1 对 alpha 过渡像素通道错位也看不出色偏。
+    let r = s * 0.18;
+    let cx = fx.clamp(r, s - r);
+    let cy = fy.clamp(r, s - r);
+    let (dx, dy) = (fx - cx, fy - cy);
+    let d = (dx * dx + dy * dy).sqrt();
+    if d > r + 0.5 {
+        return [b_ch, g_ch, r_ch, 0]; // 圆角外:透明(RGB 保持渐变色)
+    }
+    if d > r - 0.5 {
+        // 圆角边缘 1px 线性 alpha 过渡(抗锯齿)
+        let a = (((r + 0.5 - d) * 255.0).round() as u8).clamp(1, 254);
+        return [b_ch, g_ch, r_ch, a];
+    }
+
 
     // "C" 字形:白色
     if x >= gx && x < gx + 5 * scale && y >= gy && y < gy + 7 * scale {
