@@ -58,12 +58,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ES_AUTOVSCROLL, ES_READONLY, ES_WANTRETURN, GetCursorPos, CB_ADDSTRING, CB_GETCURSEL,
     CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
     GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW, GetSystemMetrics,
-    GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, KillTimer,
+    GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, IsIconic, IsWindow, KillTimer,
     LoadIconW, LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SendMessageW, SetWindowLongPtrW, SetWindowTextW,
+    RegisterWindowMessageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
     IMAGE_ICON, LR_DEFAULTCOLOR,
-    SW_HIDE, SW_SHOW, TrackPopupMenu,
+    SW_HIDE, SW_RESTORE, SW_SHOW, TrackPopupMenu,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     CallWindowProcW, WS_EX_CLIENTEDGE, ICON_BIG,
     ICON_SMALL,
     WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON,
@@ -154,6 +155,8 @@ static EXCLUDE_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LANGUAGE: Mutex<Lang> = Mutex::new(Lang::Zh);
 /// 选项面板是否打开(打开期间屏蔽托盘交互)
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
+/// 选项面板窗口句柄(面板已打开时托盘点击置前用),存位模式以保持 static Sync
+static OPTIONS_HWND: AtomicUsize = AtomicUsize::new(0);
 /// 当前点击固定的问号控件 ID(说明栏保持显示);None 表示未固定
 static HELP_PINNED: Mutex<Option<usize>> = Mutex::new(None);
 /// Static 类原始窗口过程(问号图标的子类化链回目标)
@@ -423,13 +426,17 @@ unsafe fn create_hidden_window(hmod: *mut core::ffi::c_void) -> HWND {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_TRAYICON => {
-            // 选项面板打开期间屏蔽托盘交互,避免面板与菜单状态不同步
-            if OPTIONS_OPEN.load(Ordering::Relaxed) {
-                return 0;
-            }
             let evt = (lparam as usize) & 0xffff;
             match evt as u32 {
-                WM_RBUTTONUP | WM_CONTEXTMENU | WM_LBUTTONUP => show_tray_menu(hwnd),
+                WM_RBUTTONUP | WM_CONTEXTMENU | WM_LBUTTONUP => {
+                    // 选项面板打开期间不弹菜单(避免面板与菜单状态不同步),改而把面板置前,
+                    // 防止被其他窗口覆盖、误以为托盘点击无效
+                    if OPTIONS_OPEN.load(Ordering::Relaxed) {
+                        bring_options_to_front();
+                    } else {
+                        show_tray_menu(hwnd);
+                    }
+                }
                 _ => {}
             }
             0
@@ -558,6 +565,26 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     }
     // 让菜单正确关闭的标准做法
     PostMessageW(hwnd, WM_NULL, 0, 0);
+}
+
+/// 选项面板已存在时将其置前(必要时先还原最小化),防止被其他窗口覆盖。
+/// 托盘点击时调用,替代面板打开期间被屏蔽的菜单弹出,避免误以为托盘点击无效。
+///
+/// SetForegroundWindow 受前台锁限制,后台进程调用可能被系统拒绝(点击托盘时
+/// 由 shell 授予权限,通常成功);先以 topmost 闪烁强制面板回到 z 序最顶层兜底,
+/// 再尝试激活抢焦点。
+unsafe fn bring_options_to_front() {
+    let opt = OPTIONS_HWND.load(Ordering::Relaxed) as HWND;
+    if opt.is_null() || IsWindow(opt) == 0 {
+        return;
+    }
+    if IsIconic(opt) != 0 {
+        ShowWindow(opt, SW_RESTORE);
+    }
+    // topmost 闪烁:置顶再解除,不依赖前台权限即可把面板抬到所有普通窗口之上
+    SetWindowPos(opt, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(opt, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(opt);
 }
 
 // ---------- 语言(i18n) ----------
@@ -1241,6 +1268,7 @@ unsafe fn open_options_panel(owner: HWND) {
         return;
     }
     OPTIONS_OPEN.store(true, Ordering::Relaxed);
+    OPTIONS_HWND.store(hwnd as usize, Ordering::Relaxed);
     log_write(&format!("打开选项面板 hwnd={hwnd:?}"));
     create_options_controls(hwnd, hmod);
     // 标题栏图标与程序托盘图标一致
@@ -1761,6 +1789,7 @@ unsafe extern "system" fn options_wnd_proc(
         // 不 PostQuitMessage:主消息泵由托盘窗口的 WM_DESTROY 终止
         WM_DESTROY => {
             OPTIONS_OPEN.store(false, Ordering::Relaxed);
+            OPTIONS_HWND.store(0, Ordering::Relaxed);
             HELP_PINNED.lock().take();
             0
         }
@@ -2365,5 +2394,117 @@ mod menu_icon_tests {
         let globe = draw_menu_icon_pixels(MenuIcon::Language);
         let has_semi = globe.chunks(4).any(|px| px[3] > 0 && px[3] < 255);
         assert!(has_semi, "地球图标应含半透明像素");
+    }
+}
+
+// ===== 回归测试:托盘点击时选项面板置前(面板存在时点击托盘应抬升面板而非弹菜单) =====
+#[cfg(test)]
+mod tray_raise_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GW_HWNDPREV, GetWindow, PM_REMOVE, PeekMessageW, SW_MINIMIZE,
+        WS_OVERLAPPEDWINDOW,
+    };
+
+    /// a 是否在 b 的 z 序上方(从 b 向上走链找 a)
+    fn is_above(a: HWND, b: HWND) -> bool {
+        let mut cur = unsafe { GetWindow(b, GW_HWNDPREV) };
+        while !cur.is_null() {
+            if cur == a {
+                return true;
+            }
+            cur = unsafe { GetWindow(cur, GW_HWNDPREV) };
+        }
+        false
+    }
+
+    fn pump(ms: u64) {
+        let start = Instant::now();
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while (start.elapsed().as_millis() as u64) < ms {
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn find_menu() -> HWND {
+        unsafe { FindWindowW(to_utf16("#32768").as_ptr(), std::ptr::null()) }
+    }
+
+    #[test]
+    fn tray_click_raises_open_options_panel() {
+        unsafe {
+            let hmod = GetModuleHandleW(std::ptr::null::<u16>());
+            assert!(register_window_class(hmod), "注册托盘窗口类");
+            assert!(register_options_window_class(hmod), "注册面板窗口类");
+
+            let tray = create_hidden_window(hmod);
+            assert!(!tray.is_null(), "创建隐藏窗口");
+
+            // 打开选项面板(真实窗口)
+            open_options_panel(tray);
+            let opt = FindWindowW(to_utf16(OPTIONS_WINDOW_CLASS).as_ptr(), std::ptr::null());
+            assert!(!opt.is_null(), "选项面板应已创建");
+            assert!(OPTIONS_OPEN.load(Ordering::Relaxed));
+            assert_eq!(OPTIONS_HWND.load(Ordering::Relaxed) as HWND, opt, "句柄已记录");
+            pump(100);
+
+            // 覆盖窗口(同一类,普通顶层窗口)
+            let cover = CreateWindowExW(
+                0,
+                to_utf16(WINDOW_CLASS).as_ptr(),
+                to_utf16("cover-probe").as_ptr(),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                400,
+                300,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                hmod,
+                std::ptr::null_mut(),
+            );
+            assert!(!cover.is_null(), "创建覆盖窗口");
+            ShowWindow(cover, SW_SHOW);
+            pump(100);
+            // topmost 闪烁强制覆盖窗口置顶(不依赖前台权限,确定性)
+            SetWindowPos(cover, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            SetWindowPos(cover, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            pump(100);
+            assert!(is_above(cover, opt), "覆盖窗口应在面板之上");
+
+            // 托盘点击 → 面板置前,且不弹菜单
+            assert!(find_menu().is_null(), "点击前不应有菜单");
+            wnd_proc(tray, WM_TRAYICON, 0, WM_RBUTTONUP as LPARAM);
+            pump(300);
+            // 用户可见效果:面板回到覆盖窗口之上
+            assert!(is_above(opt, cover), "面板应被置前(覆盖窗口之上)");
+            assert!(find_menu().is_null(), "面板打开期间不应弹菜单");
+
+            // 最小化面板 → 托盘点击 → 还原并置前
+            ShowWindow(opt, SW_MINIMIZE);
+            pump(100);
+            assert_ne!(IsIconic(opt), 0, "面板已最小化");
+            wnd_proc(tray, WM_TRAYICON, 0, WM_RBUTTONUP as LPARAM);
+            pump(300);
+            assert_eq!(IsIconic(opt), 0, "面板应被还原");
+            assert!(is_above(opt, cover), "还原后面板应在覆盖窗口之上");
+
+            // 关闭面板 → 状态清理
+            PostMessageW(opt, WM_CLOSE, 0, 0);
+            pump(200);
+            assert_eq!(IsWindow(opt), 0, "面板应已销毁");
+            assert!(!OPTIONS_OPEN.load(Ordering::Relaxed));
+            assert_eq!(OPTIONS_HWND.load(Ordering::Relaxed), 0, "句柄应已清空");
+
+            DestroyWindow(cover);
+            DestroyWindow(tray);
+        }
     }
 }
