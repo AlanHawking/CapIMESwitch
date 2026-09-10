@@ -38,7 +38,7 @@ CapIMESwitch 将 Windows 侧统一为「**短按 CapsLock 切换输入法**」�
 - **Conflict cancel**: pressing another key during a long-press cancels the action, avoiding misfires<br>**冲突取消**：长按期间按下其他键则取消本次动作，避免误触发
 - **System-tray resident**: runs as a hidden window — no taskbar, no window; right-click tray menu offers "Start on boot" toggle, "Options" panel, and "Exit"<br>**系统托盘常驻**：隐藏窗口运行，无任务栏、无窗口；右键托盘菜单提供「开机启动」勾选、「选项」面板与「退出」
 - **Options panel**: start-on-boot checkbox (shares registry state with menu, applied on save); adjustable long-press threshold 100–5000ms, applied immediately<br>**选项面板**：开机启动勾选（与菜单共享注册表状态，保存后生效）；长按阈值可调 100–5000ms，保存即生效
-- **Bilingual UI**: tray menu and option panel switch between Chinese and English (follows system language by default), applied instantly and persisted<br>**中英文界面**：托盘菜单与选项面板均可切换语言（默认跟随系统语言），切换即时生效并持久化
+- **8-language UI**: tray menu and option panel switch among 8 languages — 简体中文, English, 日本語, 한국어, Français, Deutsch, Español, Русский (follows system language by default), applied instantly and persisted<br>**八国语言界面**：托盘菜单与选项面板均可切换 8 种语言（简体中文/English/日本語/한국어/Français/Deutsch/Español/Русский，默认跟随系统语言），切换即时生效并持久化
 - **Config persistence**: edits `config.toml` beside the exe (hand-editable, migrates with the folder); falls back to defaults if missing or corrupted<br>**配置持久化**：exe 同目录 `config.toml`（可人工编辑、随目录迁移），缺失或损坏时自动回退默认值
 - **Auto-start**: registered at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, auto-cleaned on uninstall<br>**开机自启动**：通过 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册，卸载时自动清理
 - **Single-instance protection**: named mutex prevents duplicate launches; a second launch prompts and exits<br>**单实例保护**：命名互斥体防止重复运行，二次启动时提示并退出
@@ -123,7 +123,7 @@ The installer supports bilingual (Chinese/English) UI and installs to `%LOCALAPP
 │   ├── main.rs      # Entry: tray, hook, action injection, auto-start, options panel / 入口：托盘、钩子、动作注入、自启动注册、选项面板
 │   ├── caps.rs      # CapsLock short/long-press state machine (pure logic, unit-testable) / 长短按状态机（纯逻辑，可单测）
 │   ├── config.rs    # config.toml read/write (missing/corrupted → defaults) / 配置读写（缺失/损坏回退默认值）
-│   └── i18n.rs      # Language enum & bilingual user-facing string table (pure logic, unit-testable) / 语言枚举与中英文用户可见字符串表（纯逻辑，可单测）
+│   └── i18n.rs      # Language enum & 8-language user-facing string table (pure logic, unit-testable) / 语言枚举与八国语言用户可见字符串表（纯逻辑，可单测）
 ├── docs/
 │   ├── adr/         # Architecture decision records / 架构决策记录
 │   └── glossary.md  # Glossary / 术语表

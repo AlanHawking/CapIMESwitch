@@ -14,7 +14,7 @@ mod i18n;
 
 use i18n::Lang;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
@@ -26,6 +26,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetDC, GetStockObject, GetTextExtentPoint32W, ReleaseDC, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
     DIB_RGB_COLORS, CreateDIBSection, CreateBitmap, DeleteObject, HBRUSH, HBITMAP, HDC,
+    BeginPaint, CreateSolidBrush, DrawTextW, DT_CENTER, DT_SINGLELINE, DT_VCENTER, EndPaint,
+    InflateRect, InvalidateRect, PAINTSTRUCT, RoundRect, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -73,7 +75,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MENUITEMINFOW, MSG, SetMenuItemInfoW,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
-    WM_MOUSEMOVE,
+    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
     WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     WNDCLASSW,
@@ -100,10 +102,8 @@ const ID_MENU_EXIT: usize = 1001;
 const ID_MENU_AUTOSTART: usize = 1002;
 /// 托盘菜单"选项"命令 ID
 const ID_MENU_OPTIONS: usize = 1003;
-/// 托盘菜单"语言:简体中文"命令 ID
-const ID_MENU_LANG_ZH: usize = 1004;
-/// 托盘菜单"语言:English"命令 ID
-const ID_MENU_LANG_EN: usize = 1005;
+/// 托盘菜单"语言"子菜单首个命令 ID(语言项 = 本值 + Lang::all() 索引)
+const ID_MENU_LANG_FIRST: usize = 1004;
 /// 隐藏窗口类名
 const WINDOW_CLASS: &str = "CapIMESwitchTrayWindow";
 /// 单实例互斥体名(跨进程唯一)
@@ -161,6 +161,10 @@ static OPTIONS_HWND: AtomicUsize = AtomicUsize::new(0);
 static HELP_PINNED: Mutex<Option<usize>> = Mutex::new(None);
 /// Static 类原始窗口过程(问号图标的子类化链回目标)
 static ORIG_STATIC_PROC: AtomicUsize = AtomicUsize::new(0);
+/// 保存按钮自绘状态:0 正常 / 1 悬停 / 2 按下
+static SAVE_BTN_STATE: AtomicU8 = AtomicU8::new(0);
+/// 保存按钮原始窗口过程(子类化链回目标)
+static ORIG_SAVE_PROC: AtomicUsize = AtomicUsize::new(0);
 /// 当前语言的全部用户可见字符串(锁在返回后立即释放,引用为 'static)
 fn tr() -> &'static i18n::Strings {
     LANGUAGE.lock().strings()
@@ -505,23 +509,14 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
 
-    // 语言子菜单:各语言带互斥勾选,选项显示母语名
+    // 语言子菜单:各语言带互斥勾选,选项显示母语名(Lang::all() 顺序)
     let lang_menu = CreatePopupMenu();
     let cur_lang = *LANGUAGE.lock();
-    let zh_label = to_utf16(strings.lang_zh);
-    let en_label = to_utf16(strings.lang_en);
-    AppendMenuW(
-        lang_menu,
-        MF_STRING | if cur_lang == Lang::Zh { MF_CHECKED } else { 0 },
-        ID_MENU_LANG_ZH,
-        zh_label.as_ptr(),
-    );
-    AppendMenuW(
-        lang_menu,
-        MF_STRING | if cur_lang == Lang::En { MF_CHECKED } else { 0 },
-        ID_MENU_LANG_EN,
-        en_label.as_ptr(),
-    );
+    for (i, lang) in Lang::all().iter().enumerate() {
+        let label = to_utf16(lang.display_name());
+        let checked = if *lang == cur_lang { MF_CHECKED } else { 0 };
+        AppendMenuW(lang_menu, MF_STRING | checked, ID_MENU_LANG_FIRST + i, label.as_ptr());
+    }
     let lang_label = to_utf16(strings.menu_language);
     AppendMenuW(menu, MF_POPUP, lang_menu as usize, lang_label.as_ptr());
 
@@ -558,9 +553,13 @@ unsafe fn show_tray_menu(hwnd: HWND) {
             }
         }
         ID_MENU_OPTIONS => open_options_panel(hwnd),
-        ID_MENU_LANG_ZH => set_language(Lang::Zh),
-        ID_MENU_LANG_EN => set_language(Lang::En),
         ID_MENU_EXIT => PostQuitMessage(0),
+        _ if (cmd as usize) >= ID_MENU_LANG_FIRST && (cmd as usize) < ID_MENU_LANG_FIRST + Lang::all().len() => {
+            let idx = (cmd as usize) - ID_MENU_LANG_FIRST;
+            if let Some(lang) = Lang::all().get(idx) {
+                set_language(*lang);
+            }
+        }
         _ => {}
     }
     // 让菜单正确关闭的标准做法
@@ -589,7 +588,7 @@ unsafe fn bring_options_to_front() {
 
 // ---------- 语言(i18n) ----------
 
-/// 解析配置中的语言值:zh/en 直接使用;auto 与未知值按系统 UI 语言解析
+/// 解析配置中的语言值:支持的语言直接使用;auto 与未知值按系统 UI 语言解析
 fn resolve_language(cfg_lang: &str) -> Lang {
     match Lang::parse(cfg_lang) {
         Some(l) => l,
@@ -597,16 +596,22 @@ fn resolve_language(cfg_lang: &str) -> Lang {
     }
 }
 
-/// 系统 UI 语言:按 LCID 主语言映射 zh/en,未知回退中文
+/// 系统 UI 语言:按 LCID 主语言映射到支持的语言,未知回退中文
 fn system_language() -> Lang {
     lang_from_lcid(unsafe { GetUserDefaultUILanguage() })
 }
 
-/// 按 LCID 主语言(低 10 位)映射语言:0x04 中文系 / 0x09 英文系,其余回退中文
+/// 按 LCID 主语言(低 10 位)映射语言,未知语言回退中文
 fn lang_from_lcid(lcid: u16) -> Lang {
     match lcid & 0x3FF {
         0x04 => Lang::Zh, // 中文系(zh-CN/HK/TW/SG/MO)
-        0x09 => Lang::En, // 英文系
+        0x09 => Lang::En, // 英文系(en-US/GB/CA/AU/NZ)
+        0x11 => Lang::Ja, // 日本语(ja-JP)
+        0x12 => Lang::Ko, // 韩语系(ko-KR)
+        0x0C => Lang::Fr, // 法语系(fr-FR/CA/BE/CH)
+        0x07 => Lang::De, // 德语系(de-DE/CH/AT/LU)
+        0x0A => Lang::Es, // 西班牙语系(es-ES/MX...)
+        0x19 => Lang::Ru, // 俄语系(ru-RU)
         _ => Lang::Zh,    // 未知语言回退中文
     }
 }
@@ -1246,7 +1251,7 @@ unsafe fn open_options_panel(owner: HWND) {
     let class_name = to_utf16(OPTIONS_WINDOW_CLASS);
     let title = to_utf16(tr().panel_title);
     const W: i32 = 440;
-    const H: i32 = 330;
+    const H: i32 = 380;
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let hwnd = CreateWindowExW(
@@ -1429,6 +1434,111 @@ unsafe extern "system" fn help_icon_subproc(
             CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
         }
     }
+}
+/// 子类化保存按钮:接管自绘,保留其余消息走原始过程
+unsafe fn subclass_save_button(btn: HWND) {
+    if ORIG_SAVE_PROC.load(Ordering::Relaxed) == 0 {
+        let cls = GetClassLongPtrW(btn, GCLP_WNDPROC) as usize;
+        ORIG_SAVE_PROC.store(cls, Ordering::Relaxed);
+    }
+    SetWindowLongPtrW(btn, GWLP_WNDPROC, save_btn_proc as *const () as isize);
+}
+
+/// 保存按钮子类化窗口过程:自绘扁平按钮,跟踪悬停/按下状态
+unsafe extern "system" fn save_btn_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            draw_save_button(hdc, hwnd, SAVE_BTN_STATE.load(Ordering::Relaxed));
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_MOUSEMOVE => {
+            if SAVE_BTN_STATE.load(Ordering::Relaxed) != 1 {
+                track_mouse_leave(hwnd);
+                SAVE_BTN_STATE.store(1, Ordering::Relaxed);
+                redraw_button(hwnd);
+            }
+            0
+        }
+        WM_MOUSELEAVE => {
+            SAVE_BTN_STATE.store(0, Ordering::Relaxed);
+            redraw_button(hwnd);
+            0
+        }
+        WM_LBUTTONDOWN => {
+            SAVE_BTN_STATE.store(2, Ordering::Relaxed);
+            redraw_button(hwnd);
+            call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONUP => {
+            SAVE_BTN_STATE.store(1, Ordering::Relaxed);
+            redraw_button(hwnd);
+            call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam)
+        }
+        _ => call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 转调子类化前的原始窗口过程
+unsafe fn call_original(original: isize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if original == 0 {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
+}
+
+/// 登记鼠标离开跟踪(收到 WM_MOUSELEAVE 后置回正常态)
+unsafe fn track_mouse_leave(hwnd: HWND) {
+    let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
+    tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
+    tme.dwFlags = TME_LEAVE;
+    tme.hwndTrack = hwnd;
+    TrackMouseEvent(&mut tme);
+}
+
+/// 触发按钮重绘
+unsafe fn redraw_button(hwnd: HWND) {
+    InvalidateRect(hwnd, std::ptr::null(), 0);
+    UpdateWindow(hwnd);
+}
+
+/// 自绘保存按钮:品牌蓝圆角扁平钮,分正常/悬停/按下三态,白色文字居中
+unsafe fn draw_save_button(hdc: HDC, hwnd: HWND, state: u8) {
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let color = match state {
+        2 => 0x00C86E23u32, // 按下:更深的品牌蓝
+        1 => 0x00F0963Cu32, // 悬停:更亮的品牌蓝
+        _ => 0x00E67E2Du32, // 正常:品牌蓝 #2D7EE6
+    };
+    let brush = CreateSolidBrush(color);
+    let old = SelectObject(hdc, brush);
+    RoundRect(hdc, rc.left, rc.top, rc.right + 1, rc.bottom + 1, 12, 12);
+    SelectObject(hdc, old);
+    DeleteObject(brush);
+
+    // 居中白色标签
+    SetBkMode(hdc, TRANSPARENT as i32);
+    SetTextColor(hdc, 0x00FFFFFF);
+    let old_font = SelectObject(hdc, GetStockObject(DEFAULT_GUI_FONT));
+    let label = to_utf16(tr().save);
+    let mut trect = rc;
+    InflateRect(&mut trect, -8, -4);
+    DrawTextW(
+        hdc,
+        label.as_ptr(),
+        label.len() as i32 - 1,
+        &mut trect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    SelectObject(hdc, old_font);
 }
 
 /// 创建选项面板子控件。
@@ -1693,9 +1803,9 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         std::ptr::null(),
         WS_CHILD | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
         16,
-        212,
+        224,
         408,
-        40,
+        44,
         parent,
         (ID_OPT_HELP_BAR as usize) as *mut core::ffi::c_void,
         hmod,
@@ -1714,7 +1824,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         ver_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         16,
-        268,
+        292,
         200,
         20,
         parent,
@@ -1734,7 +1844,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         client_w - 24 - 80,
-        262,
+        292,
         80,
         28,
         parent,
@@ -1744,6 +1854,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     );
     if !save.is_null() {
         set_control_font(save);
+        subclass_save_button(save);
     }
 }
 
@@ -2246,11 +2357,31 @@ mod lang_tests {
     }
 
     #[test]
+    fn lcid_maps_ja_ko_ru_variants() {
+        assert_eq!(lang_from_lcid(0x0411), Lang::Ja); // ja-JP
+        assert_eq!(lang_from_lcid(0x0412), Lang::Ko); // ko-KR
+        assert_eq!(lang_from_lcid(0x0419), Lang::Ru); // ru-RU
+    }
+
+    #[test]
+    fn lcid_maps_fr_de_es_variants() {
+        for lcid in [0x040Cu16, 0x080C, 0x0C0C, 0x140C] {
+            assert_eq!(lang_from_lcid(lcid), Lang::Fr, "lcid=0x{lcid:04X}"); // fr-FR/BE/CA/CH
+        }
+        for lcid in [0x0407u16, 0x0807, 0x0C07, 0x1007] {
+            assert_eq!(lang_from_lcid(lcid), Lang::De, "lcid=0x{lcid:04X}"); // de-DE/CH/AT/LU
+        }
+        for lcid in [0x040Au16, 0x080A, 0x0C0A] {
+            assert_eq!(lang_from_lcid(lcid), Lang::Es, "lcid=0x{lcid:04X}"); // es-ES/MX/...
+        }
+    }
+
+    #[test]
     fn unknown_lcid_falls_back_to_zh() {
-        // 日语/法语/德语等未知语言回退中文
-        assert_eq!(lang_from_lcid(0x0411), Lang::Zh); // ja-JP
-        assert_eq!(lang_from_lcid(0x040C), Lang::Zh); // fr-FR
-        assert_eq!(lang_from_lcid(0x0407), Lang::Zh); // de-DE
+        // 意大利语/葡萄牙语/南非荷兰语等未支持语言回退中文
+        assert_eq!(lang_from_lcid(0x0410), Lang::Zh); // it-IT
+        assert_eq!(lang_from_lcid(0x0816), Lang::Zh); // pt-PT
+        assert_eq!(lang_from_lcid(0x0436), Lang::Zh); // af-ZA
     }
 }
 

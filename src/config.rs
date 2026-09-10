@@ -138,7 +138,7 @@ mod tests {
     fn invalid_language_falls_back_to_auto() {
         let p = temp_path("langbad");
         let _ = fs::remove_file(&p);
-        fs::write(&p, "language = \"fr\"\n").unwrap();
+        fs::write(&p, "language = \"pt\"\n").unwrap();
         assert_eq!(load(&p).language, "auto");
         fs::write(&p, "language = \"zh\"\n").unwrap();
         assert_eq!(load(&p).language, "zh");
@@ -226,7 +226,7 @@ mod tests {
         let cfg = Config {
             long_press_ms: 500,
             exclude_processes: Vec::new(),
-            language: "fr".to_string(),
+            language: "pt".to_string(),
         };
         assert_eq!(cfg.sanitized().language, "auto");
     }
