@@ -138,8 +138,11 @@ const ID_OPT_EDIT_EXCLUDE: usize = 2005;
 const ID_OPT_HELP_AUTOSTART: usize = 2008;
 const ID_OPT_HELP_DELAY: usize = 2009;
 const ID_OPT_HELP_EXCLUDE: usize = 2010;
+
 /// 版本号文本 ID(底部灰色小字)
 const ID_OPT_VERSION: usize = 2011;
+/// 版权/MIT 许可文本 ID(版本号下方灰色小字)
+const ID_OPT_COPYRIGHT: usize = 2016;
 /// 说明栏控件 ID(面板底部只读文本,点击/悬浮问号时显示说明)
 const ID_OPT_HELP_BAR: usize = 2012;
 /// 选项面板语言下拉框 ID
@@ -2070,6 +2073,26 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(ver);
     }
 
+    // 版权/MIT 许可:版本号下方灰色小字(与 LICENSE 一致,版权归 AlanHawking)
+    let cpr_text = to_utf16("© 2026 AlanHawking · MIT License");
+    let cpr = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        cpr_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        16,
+        348,
+        300,
+        16,
+        parent,
+        (ID_OPT_COPYRIGHT as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !cpr.is_null() {
+        set_control_font(cpr);
+    }
+
     // 保存按钮(右下角,右/下边距 24)
     // BS_OWNERDRAW:自绘由父窗口 WM_DRAWITEM 完成,系统不再绘制任何 pressed/focus
     // 视觉。若用普通按钮自绘需拦截 WM_LBUTTONDOWN 的原始绘制,按下会闪现系统样式。
@@ -2137,8 +2160,10 @@ unsafe extern "system" fn options_wnd_proc(
             let hdc = wparam as HDC;
             SetBkMode(hdc, TRANSPARENT as i32);
             let ctrl_id = GetDlgCtrlID(lparam as HWND);
-            if msg == WM_CTLCOLORSTATIC && ctrl_id == ID_OPT_VERSION as i32 {
-                SetTextColor(hdc, 0x00808080); // 版本号灰色,与主标签区分
+            if msg == WM_CTLCOLORSTATIC
+                && (ctrl_id == ID_OPT_VERSION as i32 || ctrl_id == ID_OPT_COPYRIGHT as i32)
+            {
+                SetTextColor(hdc, 0x00808080); // 版本号/版权灰色,与主标签区分
             } else {
                 SetTextColor(hdc, 0x00000000); // 黑色主标签
             }
@@ -3010,10 +3035,10 @@ mod panel_layout_tests {
             assert!(!opt.is_null(), "选项面板应已创建");
             pump(200);
 
-            // 客户区高度:保存按钮底(328+28=356)不得越界
+            // 客户区高度:版权文本底(348+16=364)不得越界
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(opt, &mut rc);
-            assert!(rc.bottom > 356, "客户区高度不足: bottom={}", rc.bottom);
+            assert!(rc.bottom > 364, "客户区高度不足: bottom={}", rc.bottom);
 
             // 新控件必须存在
             let admin_check = GetDlgItem(opt, ID_OPT_CHECK_RUN_AS_ADMIN as i32);
@@ -3031,6 +3056,7 @@ mod panel_layout_tests {
                 ("管理员勾选框", ID_OPT_CHECK_RUN_AS_ADMIN),
                 ("保存按钮", ID_OPT_SAVE),
                 ("版本号", ID_OPT_VERSION),
+                ("版权", ID_OPT_COPYRIGHT),
                 ("帮助栏", ID_OPT_HELP_BAR),
             ] {
                 let c = GetDlgItem(opt, id as i32);
