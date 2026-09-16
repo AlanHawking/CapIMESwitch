@@ -28,6 +28,10 @@ pub struct Config {
     /// 语言偏好:auto(跟随系统 UI 语言)/zh/en;缺失或非法回退 auto
     #[serde(default = "default_language")]
     pub language: String,
+    /// 以管理员身份开机自启:true 时由计划任务(HIGHEST)在登录时提权启动,
+    /// 使 CapsLock 在管理员窗口中也能生效;false 时按普通权限运行
+    #[serde(default)]
+    pub run_as_admin: bool,
 }
 
 fn default_long_press_ms() -> u32 {
@@ -44,6 +48,7 @@ impl Default for Config {
             long_press_ms: DEFAULT_LONG_PRESS_MS,
             exclude_processes: Vec::new(),
             language: DEFAULT_LANGUAGE.to_string(),
+            run_as_admin: false,
         }
     }
 }
@@ -118,6 +123,7 @@ mod tests {
             long_press_ms: 800,
             exclude_processes: vec!["a.exe".to_string(), "b.exe".to_string()],
             language: "en".to_string(),
+            run_as_admin: true,
         };
         assert!(save(&cfg, &p));
         assert_eq!(load(&p), cfg);
@@ -175,6 +181,16 @@ mod tests {
     }
 
     #[test]
+    fn missing_run_as_admin_defaults_to_false() {
+        // 旧版本 config.toml 无 run_as_admin 字段,应回退 false(兼容升级)
+        let p = temp_path("admin_missing");
+        let _ = fs::remove_file(&p);
+        fs::write(&p, "long_press_ms = 500\n").unwrap();
+        assert!(!load(&p).run_as_admin);
+        let _ = fs::remove_file(&p);
+    }
+
+    #[test]
     fn parse_exclude_list_splits_and_normalizes() {
         let list = parse_exclude_list(" Notepad.exe , CODE.EXE,  , notepad.exe\nvscode.exe");
         assert_eq!(
@@ -214,6 +230,7 @@ mod tests {
             long_press_ms: 500,
             exclude_processes: vec![" Notepad.EXE ".to_string()],
             language: "auto".to_string(),
+            run_as_admin: false,
         };
         let cfg = cfg.sanitized();
         assert_eq!(cfg.exclude_processes, vec!["notepad.exe".to_string()]);
@@ -227,6 +244,7 @@ mod tests {
             long_press_ms: 500,
             exclude_processes: Vec::new(),
             language: "pt".to_string(),
+            run_as_admin: false,
         };
         assert_eq!(cfg.sanitized().language, "auto");
     }

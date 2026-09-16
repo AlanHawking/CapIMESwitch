@@ -41,6 +41,7 @@ CapIMESwitch 将 Windows 侧统一为「**短按 CapsLock 切换输入法**」�
 - **8-language UI**: tray menu and option panel switch among 8 languages — 简体中文, English, 日本語, 한국어, Français, Deutsch, Español, Русский (follows system language by default), applied instantly and persisted<br>**八国语言界面**：托盘菜单与选项面板均可切换 8 种语言（简体中文/English/日本語/한국어/Français/Deutsch/Español/Русский，默认跟随系统语言），切换即时生效并持久化
 - **Config persistence**: edits `config.toml` beside the exe (hand-editable, migrates with the folder); falls back to defaults if missing or corrupted<br>**配置持久化**：exe 同目录 `config.toml`（可人工编辑、随目录迁移），缺失或损坏时自动回退默认值
 - **Auto-start**: registered at `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, auto-cleaned on uninstall<br>**开机自启动**：通过 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 注册，卸载时自动清理
+- **Run as administrator** (optional): enables elevated auto-start at login via a scheduled task (`CapIMESwitchElevated`, no UAC at login) so CapsLock keeps working in elevated windows (admin cmd/PowerShell); saving prompts UAC and restarts elevated, unchecking removes the task and restarts at normal privileges<br>**以管理员身份启动**（可选）：开启后通过计划任务（`CapIMESwitchElevated`，登录时免 UAC 弹窗）以管理员权限开机自启，让 CapsLock 在管理员窗口（管理员 cmd/PowerShell）中依然可用；保存后弹出 UAC 确认并提权重启生效，取消勾选则删除任务并降回普通权限重启
 - **Single-instance protection**: named mutex prevents duplicate launches; a second launch prompts and exits<br>**单实例保护**：命名互斥体防止重复运行，二次启动时提示并退出
 - **Explorer-restart recovery**: listens for `TaskbarCreated` to rebuild the tray icon<br>**资源管理器重启恢复**：监听 `TaskbarCreated` 消息自动重建托盘图标
 - **Self-drawn icon**: multi-size (16/32/48) ICO generated programmatically in pure Rust at build time, embedded into the exe — zero external resource files<br>**自绘图标**：构建期用纯 Rust 程序化生成多尺寸（16/32/48）ICO，嵌入 exe 资源，零外部资源文件
@@ -109,7 +110,7 @@ The installer supports bilingual (Chinese/English) UI and installs to `%LOCALAPP
 1. Run the program; a tray icon appears and it starts working / 运行程序后在托盘出现图标，即可开始使用
 2. **Short-press CapsLock**：switch input method (equivalent to `Win+Space`)/ **短按 CapsLock**：切换输入法（等效 `Win+Space`）
 3. **Long-press CapsLock (default ~half second, adjustable in Options)**：toggle case / **长按 CapsLock（默认约半秒，可在选项面板调整）**：切换大小写
-4. Right-click the tray icon → "Start on boot" for auto-start; "Options" opens the settings panel (start-on-boot checkbox, long-press delay in ms, "Save" at bottom-right applies — closing unsaved discards changes); "Exit" quits / 右键托盘图标 → 「开机启动」随系统启动；「选项」打开设置面板（开机启动勾选、长按延迟毫秒数，右下角「保存」后生效，未保存直接关闭则丢弃）；「退出」完全退出
+4. Right-click the tray icon → "Start on boot" for auto-start; "Options" opens the settings panel (start-on-boot checkbox, run-as-administrator checkbox, long-press delay in ms, "Save" at bottom-right applies — closing unsaved discards changes); "Exit" quits / 右键托盘图标 → 「开机启动」随系统启动；「选项」打开设置面板（开机启动勾选、以管理员身份启动勾选、长按延迟毫秒数，右下角「保存」后生效，未保存直接关闭则丢弃）；「退出」完全退出
 
 ## Testing / 测试与验证
 

@@ -29,6 +29,11 @@ $h2 = [Win32Probe]::FindWindowExW($hwndMsg, [IntPtr]::Zero, "CapIMESwitchTrayWin
 Write-Output "first_alive=$aliveA2 hidewin1=$h1 hidewin2=$h2"
 Write-Output "second_alive=$aliveB prompt_shown=$($msgBox -ne [IntPtr]::Zero)"
 
+# 提权模式(以管理员身份启动)涉及 UAC 弹窗,不在自动化冒烟范围内;
+# 此处仅只读查询计划任务存在性,供人工核对提权功能状态
+$taskExists = (schtasks.exe /Query /TN "CapIMESwitchElevated" 2>$null) -match "CapIMESwitchElevated"
+Write-Output "elevated_task_exists=$taskExists"
+
 $b.CloseMainWindow() | Out-Null
 Start-Sleep -Milliseconds 500
 if (-not $b.HasExited) { Stop-Process -Id $b.Id -Force }

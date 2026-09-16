@@ -18,3 +18,9 @@ CapIMESwitch 项目通用术语,用于跨模块沟通与文档一致。
 | 隐藏窗口 | 类名 `CapIMESwitchTrayWindow`,HWND_MESSAGE 父窗口,接收托盘回调与 TaskbarCreated |
 | 单实例互斥体 | 命名互斥体 `CapIMESwitch_SingleInstance`,重复启动时弹错误框退出 |
 | 自启动注册表值 | `HKCU\...\Run` 下 `CapIMESwitch` 值,指向当前 exe 路径 |
+| UIPI | 用户界面特权隔离:低完整性(非提权)进程不能观察/注入高完整性(提权)进程的输入,导致管理员窗口中键盘钩子失效 |
+| 完整性级别 | Windows 进程安全级别:普通进程 Medium,管理员(UAC 提权)进程 High;UIPI 只允许同/高级别向下观察 |
+| 提权重启 | 以管理员权限重新启动自身(经 UAC 确认,`ShellExecuteW` runas);用于让钩子覆盖管理员窗口 |
+| 降权重启 | 从提权实例以普通权限重新启动自身:经 `/RL LIMITED` 一次性计划任务(`CapIMESwitchDeElevateTemp`)中转,由任务计划程序服务以普通令牌启动 `--restart` 实例 |
+| 开机启动计划任务 | 任务名 `CapIMESwitchElevated`,`schtasks /SC ONLOGON /RL HIGHEST` 创建,登录时静默提权启动 |
+| 最高权限(RL HIGHEST) | 计划任务运行级别,任务以管理员权限运行且登录时不弹 UAC;只能由管理员上下文创建/删除 |

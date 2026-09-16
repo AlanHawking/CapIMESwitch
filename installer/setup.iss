@@ -2,7 +2,7 @@
 ; 编译:ISCC.exe installer\setup.iss
 
 #define MyAppName "CapIMESwitch"
-#define MyAppVersion "0.4.4"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "CapIMESwitch"
 #define MyAppExeName "cap-ime-switch.exe"
 
@@ -49,9 +49,17 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#MyAppName}}
 Type: files; Name: "{app}\config.toml"
 
 [Code]
-// 卸载时清除程序在 HKCU Run 键中设置的开机自启动项
+// 卸载时清除程序在 HKCU Run 键中设置的开机自启动项,
+// 以及"以管理员身份启动"创建的提权计划任务(任务指向的 exe 随卸载删除,
+// 清理失败仅留下失效任务,不影响卸载本身)
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
+  begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'CapIMESwitch');
+    Exec('schtasks.exe', '/Delete /F /TN "CapIMESwitchElevated"', '',
+      SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
 end;

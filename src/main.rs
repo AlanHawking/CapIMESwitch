@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
-    LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
+    LRESULT, POINT, RECT, SIZE, SYSTEMTIME, WAIT_OBJECT_0, WPARAM,
 };
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
@@ -37,8 +37,9 @@ use windows_sys::Win32::System::Registry::{
     REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, OpenProcess, QueryFullProcessImageNameW,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateMutexW, CreateProcessW, GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+    WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, INPUT, INPUT_KEYBOARD, KEYBDINPUT,
@@ -48,8 +49,8 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForSystem, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NIF_ICON, NIF_MESSAGE, NIF_TIP,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
+    IsUserAnAdmin, Shell_NotifyIconW, ShellExecuteW, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NIF_ICON,
+    NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
@@ -59,9 +60,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_MULTILINE, ES_NUMBER,
     ES_AUTOVSCROLL, ES_READONLY, ES_WANTRETURN, GetCursorPos, CB_ADDSTRING, CB_GETCURSEL,
     CB_SETCURSEL, CBS_DROPDOWNLIST, CBS_HASSTRINGS,
-    GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW, GetSystemMetrics,
-    GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, IsIconic, IsWindow, KillTimer,
-    LoadIconW, LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
+    GetClassLongPtrW, GetClientRect, GetDlgCtrlID, GetDlgItem, GetMessageW,
+    GetSystemMetrics, GetParent, GetWindowTextW, GCLP_WNDPROC, GWLP_WNDPROC, IsIconic, IsWindow,
+    KillTimer, LoadIconW, LoadImageW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     SetForegroundWindow, SetTimer, SetWindowsHookExW, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
     IMAGE_ICON, LR_DEFAULTCOLOR,
@@ -72,8 +73,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_SETICON,
     TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, HMENU, HWND_MESSAGE, HICON,
     IDI_APPLICATION, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MB_ICONERROR, MB_OK, MF_CHECKED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MENUITEMINFOW, MSG, SetMenuItemInfoW,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MENUITEMINFOW, MSG,
+    SetMenuItemInfoW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
     WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
@@ -112,6 +113,16 @@ const SINGLE_INSTANCE_NAME: &str = "CapIMESwitch_SingleInstance";
 const AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// 自启动注册表值名
 const AUTOSTART_VALUE_NAME: &str = "CapIMESwitch";
+/// 开机提权启动计划任务名(schtasks /TN,卸载时同步清理)
+const ELEVATED_TASK_NAME: &str = "CapIMESwitchElevated";
+/// 提权/降权重启子实例的启动参数(新实例据此对单实例互斥体做重试)
+const RESTART_ARG: &str = "--restart";
+/// --restart 实例等待旧实例退出释放互斥体的最长毫秒数
+const MUTEX_RETRY_MS: u32 = 15000;
+/// schtasks 命令最长等待毫秒数
+const SCHTASKS_TIMEOUT_MS: u32 = 30000;
+/// 降权重启的一次性中转任务名(提权实例创建并触发,新实例启动时清理)
+const DE_ELEVATE_TASK: &str = "CapIMESwitchDeElevateTemp";
 /// 选项面板窗口类名
 const OPTIONS_WINDOW_CLASS: &str = "CapIMESwitchOptionsWindow";
 /// 选项面板控件 ID
@@ -130,6 +141,10 @@ const ID_OPT_VERSION: usize = 2011;
 const ID_OPT_HELP_BAR: usize = 2012;
 /// 选项面板语言下拉框 ID
 const ID_OPT_COMBO_LANGUAGE: usize = 2013;
+/// 以管理员身份启动勾选框 ID
+const ID_OPT_CHECK_RUN_AS_ADMIN: usize = 2014;
+/// 以管理员身份启动帮助问号 ID
+const ID_OPT_HELP_RUN_AS_ADMIN: usize = 2015;
 /// 静态控件样式(0.59 未导出 SS_* 常量:SS_CENTER=0x1 水平居中,
 /// SS_CENTERIMAGE=0x200 垂直居中,SS_NOTIFY=0x100 可收单击,SS_ICON=0x3 显示图标)
 const SS_CENTER: u32 = 0x0001;
@@ -153,6 +168,12 @@ static LONG_PRESS_MS: Mutex<u32> = Mutex::new(config::DEFAULT_LONG_PRESS_MS);
 static EXCLUDE_PROCESSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// 当前界面语言:启动时从 config.toml 解析(默认跟随系统),切换后即时更新
 static LANGUAGE: Mutex<Lang> = Mutex::new(Lang::Zh);
+/// 以管理员身份开机自启:启动时从 config.toml 加载,保存设置后更新
+static RUN_AS_ADMIN: AtomicBool = AtomicBool::new(false);
+/// 真实窗口测试串行门:两个测试共享进程级窗口状态(OPTIONS_OPEN/OPTIONS_HWND),
+/// 并行运行会互相污染,测试内必须持锁
+#[cfg(test)]
+static TEST_WINDOW_LOCK: Mutex<()> = Mutex::new(());
 /// 选项面板是否打开(打开期间屏蔽托盘交互)
 static OPTIONS_OPEN: AtomicBool = AtomicBool::new(false);
 /// 选项面板窗口句柄(面板已打开时托盘点击置前用),存位模式以保持 static Sync
@@ -291,21 +312,43 @@ fn main() {
             *LONG_PRESS_MS.lock() = cfg.long_press_ms;
             *EXCLUDE_PROCESSES.lock() = cfg.exclude_processes;
             *LANGUAGE.lock() = resolve_language(&cfg.language);
+            RUN_AS_ADMIN.store(cfg.run_as_admin, Ordering::Relaxed);
         }
-        // 单实例:命名互斥体跨进程唯一(类名仅进程内有效,不能用于跨进程检测)
+        // 单实例:命名互斥体跨进程唯一(类名仅进程内有效,不能用于跨进程检测)。
+        // --restart(提权/降权重启子实例)轮询等待旧实例退出释放互斥体后再进入。
+        let restarting = std::env::args().any(|a| a == RESTART_ARG);
+        // 降权重启的子实例(非提权):清理提权实例创建的一次性中转计划任务
+        if restarting && !is_elevated() {
+            run_schtasks(&format!("/Delete /F /TN \"{DE_ELEVATE_TASK}\""));
+        }
         let mutex_name = to_utf16(SINGLE_INSTANCE_NAME);
-        let instance_mutex = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
-        if instance_mutex.is_null() {
-            let err = GetLastError();
-            log_write(&format!("创建实例锁失败 GetLastError={err}"));
-            show_error(tr().err_instance_lock);
-            return;
-        }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            log_write("检测到已有实例,退出");
-            show_error(tr().err_already_running);
-            return;
-        }
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_millis(MUTEX_RETRY_MS as u64);
+        let _instance_mutex = loop {
+            let m = CreateMutexW(std::ptr::null_mut(), 0, mutex_name.as_ptr());
+            if m.is_null() {
+                let err = GetLastError();
+                log_write(&format!("创建实例锁失败 GetLastError={err}"));
+                show_error(tr().err_instance_lock);
+                return;
+            }
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                break m;
+            }
+            // 已有实例:非重启场景直接退出;重启场景轮询等待旧实例释放
+            CloseHandle(m);
+            if !restarting {
+                log_write("检测到已有实例,退出");
+                show_error(tr().err_already_running);
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                log_write("重启等待旧实例退出超时");
+                show_error(tr().err_already_running);
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
         // 句柄保持存活至进程退出(进程结束自动释放,无需 CloseHandle)
 
         let hmod = GetModuleHandleW(std::ptr::null::<u16>());
@@ -358,6 +401,10 @@ fn main() {
             return;
         }
         log_write("键盘钩子安装成功,进入消息循环");
+
+        // 提权模式:确保开机提权启动计划任务存在(创建仅提权上下文可成功,
+        // 失败非致命——本会话仍以管理员运行,仅影响下次开机)
+        ensure_scheduled_task();
 
         // 消息泵:派发托盘回调、WM_TIMER 与 WM_DESTROY 给窗口过程
         let mut msg: MSG = std::mem::zeroed();
@@ -499,10 +546,17 @@ unsafe fn show_tray_menu(hwnd: HWND) {
     let menu = CreatePopupMenu();
     let strings = tr();
 
-    // 开机启动:根据注册表当前状态用图标颜色区分(启用=绿,关闭=红)
-    let auto_start = is_autostart_enabled();
+    // 开机启动:根据注册表当前状态用图标颜色区分(启用=绿,关闭=红)。
+    // 管理员模式下由计划任务承担开机启动,菜单项置灰,引导到选项面板管理。
+    let admin_mode = RUN_AS_ADMIN.load(Ordering::Relaxed);
+    let auto_start = admin_mode || is_autostart_enabled();
+    let autostart_flags = if admin_mode {
+        MF_STRING | MF_GRAYED
+    } else {
+        MF_STRING
+    };
     let autostart_label = to_utf16(strings.menu_autostart);
-    AppendMenuW(menu, MF_STRING, ID_MENU_AUTOSTART, autostart_label.as_ptr());
+    AppendMenuW(menu, autostart_flags, ID_MENU_AUTOSTART, autostart_label.as_ptr());
 
     let options_label = to_utf16(strings.menu_options);
     AppendMenuW(menu, MF_STRING, ID_MENU_OPTIONS, options_label.as_ptr());
@@ -683,6 +737,8 @@ enum MenuIcon {
     Clock,
     /// 排除程序:禁止
     Blocked,
+    /// 以管理员身份启动:盾牌
+    Shield,
 }
 
 /// 直通 alpha 合成器
@@ -880,6 +936,18 @@ fn draw_blocked(p: &mut Rgba, x: f32, y: f32) {
     fill_line(p, x, y, 12.0, 4.0, 4.0, 12.0, 0.6, ICON_BLUE);
 }
 
+/// 绘制盾牌:顶部横梁 + 两侧斜边下收成尖底 + 内部对勾(代表权限)
+fn draw_shield(p: &mut Rgba, x: f32, y: f32) {
+    // 顶部横梁
+    fill_line(p, x, y, 4.0, 3.0, 12.0, 3.0, 0.6, ICON_BLUE);
+    // 左右斜边(收于底部尖点)
+    fill_line(p, x, y, 4.0, 3.0, 7.5, 13.0, 0.6, ICON_BLUE);
+    fill_line(p, x, y, 12.0, 3.0, 7.5, 13.0, 0.6, ICON_BLUE);
+    // 内部对勾
+    fill_line(p, x, y, 5.5, 7.8, 7.2, 9.4, 0.55, ICON_BLUE);
+    fill_line(p, x, y, 7.2, 9.4, 10.2, 6.2, 0.55, ICON_BLUE);
+}
+
 /// 计算 16x16 图标某像素的 BGRA(自顶向下行序,像素中心在 +0.5)
 fn menu_icon_pixel(kind: MenuIcon, x: f32, y: f32) -> (u8, u8, u8, u8) {
     let mut p = Rgba::transparent();
@@ -892,6 +960,7 @@ fn menu_icon_pixel(kind: MenuIcon, x: f32, y: f32) -> (u8, u8, u8, u8) {
         MenuIcon::Exit => draw_exit(&mut p, x, y),
         MenuIcon::Clock => draw_clock(&mut p, x, y),
         MenuIcon::Blocked => draw_blocked(&mut p, x, y),
+        MenuIcon::Shield => draw_shield(&mut p, x, y),
     }
     p.to_bgra()
 }
@@ -914,7 +983,7 @@ fn draw_menu_icon_pixels(kind: MenuIcon) -> Vec<u8> {
 }
 
 /// 菜单图标位图缓存(按 MenuIcon 顺序索引,0 = 未创建)
-static MENU_ICON_BITMAPS: Mutex<[usize; 8]> = Mutex::new([0; 8]);
+static MENU_ICON_BITMAPS: Mutex<[usize; 9]> = Mutex::new([0; 9]);
 
 /// 惰性创建并缓存指定菜单图标位图
 fn menu_icon_bitmap(kind: MenuIcon) -> HBITMAP {
@@ -966,7 +1035,7 @@ fn destroy_menu_icon_bitmaps() {
 }
 
 /// 选项面板标签图标 HICON 缓存(按 MenuIcon 顺序索引,0 = 未创建)
-static PANEL_ICON_ICONS: Mutex<[usize; 8]> = Mutex::new([0; 8]);
+static PANEL_ICON_ICONS: Mutex<[usize; 9]> = Mutex::new([0; 9]);
 
 /// 惰性创建并缓存面板标签图标 HICON
 fn panel_icon_hicon(kind: MenuIcon) -> HICON {
@@ -1163,6 +1232,136 @@ fn toggle_autostart() -> bool {
     }
 }
 
+// ---------- 提权自启动(计划任务) ----------
+
+/// 当前进程是否以管理员权限运行(UIPI 高完整性)
+fn is_elevated() -> bool {
+    unsafe { IsUserAnAdmin() != 0 }
+}
+
+/// 当前 exe 绝对路径(不带引号)
+fn current_exe_path() -> String {
+    std::env::current_exe()
+        .unwrap_or_default()
+        .display()
+        .to_string()
+}
+
+/// 同步执行 schtasks 并返回进程退出码是否为 0(隐藏控制台窗口)
+fn run_schtasks(args: &str) -> bool {
+    unsafe {
+        let cmdline = to_utf16(&format!("schtasks.exe {args}"));
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        if CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_ptr() as *mut u16,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        ) == 0
+        {
+            return false;
+        }
+        CloseHandle(pi.hThread);
+        // WAIT_OBJECT_0 = 超时前完成;随后读取退出码判定
+        let finished = WaitForSingleObject(pi.hProcess, SCHTASKS_TIMEOUT_MS) == WAIT_OBJECT_0;
+        let mut code = 0u32;
+        let ok = finished && GetExitCodeProcess(pi.hProcess, &mut code) != 0 && code == 0;
+        CloseHandle(pi.hProcess);
+        ok
+    }
+}
+
+/// 开机提权启动计划任务是否已存在
+fn scheduled_task_exists() -> bool {
+    run_schtasks(&format!("/Query /TN \"{ELEVATED_TASK_NAME}\""))
+}
+
+/// 创建开机提权启动计划任务(登录时以最高权限运行;仅提权上下文可成功)
+fn create_scheduled_task() -> bool {
+    let exe = current_exe_path();
+    run_schtasks(&format!(
+        "/Create /F /SC ONLOGON /RL HIGHEST /TN \"{ELEVATED_TASK_NAME}\" /TR \"{exe}\""
+    ))
+}
+
+/// 删除开机提权启动计划任务(仅提权上下文可成功)
+fn delete_scheduled_task() -> bool {
+    run_schtasks(&format!("/Delete /F /TN \"{ELEVATED_TASK_NAME}\""))
+}
+
+/// 提权实例启动时的任务协调:配置要求管理员模式但任务缺失则补建(幂等)。
+/// 创建失败返回 false(非致命,调用方提示后继续以管理员运行)。
+unsafe fn ensure_scheduled_task() {
+    if RUN_AS_ADMIN.load(Ordering::Relaxed) && is_elevated() && !scheduled_task_exists() {
+        if create_scheduled_task() {
+            log_write(&format!("开机提权启动计划任务已创建: {ELEVATED_TASK_NAME}"));
+        } else {
+            log_write("创建开机提权启动计划任务失败");
+            show_error(tr().err_create_elevated_task);
+        }
+    }
+}
+
+/// 以管理员权限重启自身(触发 UAC),返回是否成功启动;成功后调用方应立即退出
+fn restart_elevated() -> bool {
+    unsafe {
+        let exe = to_utf16(&current_exe_path());
+        let verb = to_utf16("runas");
+        let args = to_utf16(RESTART_ARG);
+        // 工作目录:exe 所在目录(config.toml 同目录),保证提权实例读到同一配置
+        let dir = to_utf16(
+            &config_path()
+                .and_then(|p| p.parent().map(|d| d.display().to_string()))
+                .unwrap_or_default(),
+        );
+        let ret = ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            exe.as_ptr(),
+            args.as_ptr(),
+            dir.as_ptr(),
+            SW_HIDE,
+        );
+        let ok = (ret as usize) > 32;
+        log_write(&format!("提权重启: ShellExecuteW ret={:?} ok={ok}", ret as usize));
+        ok
+    }
+}
+
+/// 以普通权限重启自身:经任务计划程序中转——由提权实例创建一个
+/// 普通权限(/RL LIMITED)的一次性计划任务并立即触发,任务计划程序服务
+/// 以当前用户的普通令牌启动 --restart 实例。
+/// 不依赖令牌复制/特权启用,规避 UAC 下受限令牌导致
+/// CreateProcessWithTokenW(ERROR_ACCESS_DENIED=5) 与
+/// CreateProcessAsUserW(ERROR_PRIVILEGE_NOT_HELD=1314) 失败的问题。
+fn restart_unelevated() -> bool {
+    let exe = current_exe_path();
+    // ONCE 触发器的 /ST 仅作格式占位(/Run 无条件立即触发);
+    // /RL LIMITED 保证任务以普通权限运行
+    let create = format!(
+        "/Create /F /SC ONCE /ST 23:59 /RL LIMITED /TN \"{DE_ELEVATE_TASK}\" /TR \"\\\"{exe}\\\" {RESTART_ARG}\""
+    );
+    if !run_schtasks(&create) {
+        log_write("降权重启失败: 创建一次性降权任务失败");
+        return false;
+    }
+    if !run_schtasks(&format!("/Run /TN \"{DE_ELEVATE_TASK}\"")) {
+        log_write("降权重启失败: 触发一次性降权任务失败");
+        run_schtasks(&format!("/Delete /F /TN \"{DE_ELEVATE_TASK}\""));
+        return false;
+    }
+    log_write("降权重启: 一次性降权任务已触发");
+    true
+}
+
 // ---------- 长按阈值设置(config.toml 持久化) ----------
 
 /// 解析长按阈值输入:100-5000 范围内的整数(允许首尾空白),非法返回 None
@@ -1251,7 +1450,7 @@ unsafe fn open_options_panel(owner: HWND) {
     let class_name = to_utf16(OPTIONS_WINDOW_CLASS);
     let title = to_utf16(tr().panel_title);
     const W: i32 = 440;
-    const H: i32 = 380;
+    const H: i32 = 420;
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
     let hwnd = CreateWindowExW(
@@ -1357,6 +1556,7 @@ unsafe fn show_help_bar(parent: HWND, ctrl_id: usize) {
         ID_OPT_HELP_AUTOSTART => strings.help_autostart,
         ID_OPT_HELP_DELAY => strings.help_delay,
         ID_OPT_HELP_EXCLUDE => strings.help_exclude,
+        ID_OPT_HELP_RUN_AS_ADMIN => strings.help_run_as_admin,
         _ => return,
     };
     let bar = GetDlgItem(parent, ID_OPT_HELP_BAR as i32);
@@ -1558,6 +1758,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     let mut max_label = 0i32;
     for title in [
         strings.label_autostart,
+        strings.label_run_as_admin,
         strings.label_delay,
         strings.label_exclude,
         strings.label_language,
@@ -1641,14 +1842,62 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     );
     if !check.is_null() {
         set_control_font(check);
-        // 初始勾选状态与注册表一致(BM_SETCHECK)
-        if is_autostart_enabled() {
+        // 初始勾选状态与注册表一致;管理员模式下由计划任务承担开机启动,联动勾选
+        if is_autostart_enabled() || RUN_AS_ADMIN.load(Ordering::Relaxed) {
             SendMessageW(check, BM_SETCHECK, BST_CHECKED as WPARAM, 0 as LPARAM);
         }
     }
 
-    // 行 2:名称(左对齐)+ 问号 + 延迟输入框
-    create_label_icon(parent, hmod, MenuIcon::Clock, 16, 58);
+    // 行 2:以管理员身份启动:名称 + 问号 + 勾选框
+    create_label_icon(parent, hmod, MenuIcon::Shield, 16, 58);
+    let admin_label_text = to_utf16(strings.label_run_as_admin);
+    let admin_label = CreateWindowExW(
+        0,
+        static_class.as_ptr(),
+        admin_label_text.as_ptr(),
+        WS_CHILD | WS_VISIBLE,
+        label_x,
+        58,
+        max_label,
+        20,
+        parent,
+        std::ptr::null_mut(),
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !admin_label.is_null() {
+        set_control_font(admin_label);
+    }
+
+    let admin_help = create_help_icon(parent, hmod, ID_OPT_HELP_RUN_AS_ADMIN, help_x, 58);
+    if !admin_help.is_null() {
+        subclass_help_icon(admin_help);
+    }
+
+    let admin_check = CreateWindowExW(
+        0,
+        button_class.as_ptr(),
+        std::ptr::null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+        right_x,
+        56,
+        24,
+        24,
+        parent,
+        (ID_OPT_CHECK_RUN_AS_ADMIN as usize) as *mut core::ffi::c_void,
+        hmod,
+        std::ptr::null_mut(),
+    );
+    if !admin_check.is_null() {
+        set_control_font(admin_check);
+        // 初始勾选状态与配置一致(期望态)
+        if RUN_AS_ADMIN.load(Ordering::Relaxed) {
+            SendMessageW(admin_check, BM_SETCHECK, BST_CHECKED as WPARAM, 0 as LPARAM);
+        }
+    }
+
+    // 行 3:名称(左对齐)+ 问号 + 延迟输入框
+    create_label_icon(parent, hmod, MenuIcon::Clock, 16, 94);
     let label_text = to_utf16(strings.label_delay);
     let label = CreateWindowExW(
         0,
@@ -1656,7 +1905,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         label_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         label_x,
-        58,
+        94,
         max_label,
         20,
         parent,
@@ -1668,7 +1917,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(label);
     }
 
-    let help2 = create_help_icon(parent, hmod, ID_OPT_HELP_DELAY, help_x, 58);
+    let help2 = create_help_icon(parent, hmod, ID_OPT_HELP_DELAY, help_x, 94);
     if !help2.is_null() {
         subclass_help_icon(help2);
     }
@@ -1681,7 +1930,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         cur_text.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
         right_x,
-        56,
+        92,
         right_w,
         24,
         parent,
@@ -1693,8 +1942,8 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(edit);
     }
 
-    // 行 3:名称(左对齐)+ 问号 + 排除程序多行输入框
-    create_label_icon(parent, hmod, MenuIcon::Blocked, 16, 94);
+    // 行 4:名称(左对齐)+ 问号 + 排除程序多行输入框
+    create_label_icon(parent, hmod, MenuIcon::Blocked, 16, 130);
     let exclude_label_text = to_utf16(strings.label_exclude);
     let label3 = CreateWindowExW(
         0,
@@ -1702,7 +1951,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         exclude_label_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         label_x,
-        94,
+        130,
         max_label,
         20,
         parent,
@@ -1714,7 +1963,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(label3);
     }
 
-    let help3 = create_help_icon(parent, hmod, ID_OPT_HELP_EXCLUDE, help_x, 94);
+    let help3 = create_help_icon(parent, hmod, ID_OPT_HELP_EXCLUDE, help_x, 130);
     if !help3.is_null() {
         subclass_help_icon(help3);
     }
@@ -1733,7 +1982,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
             | ES_AUTOVSCROLL as u32
             | ES_WANTRETURN as u32,
         right_x,
-        92,
+        128,
         right_w,
         68,
         parent,
@@ -1745,8 +1994,8 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         set_control_font(edit2);
     }
 
-    // 行 4:名称(左对齐)+ 语言下拉框(选项显示母语名,选中项即当前语言)
-    create_label_icon(parent, hmod, MenuIcon::Language, 16, 166);
+    // 行 5:名称(左对齐)+ 语言下拉框(选项显示母语名,选中项即当前语言)
+    create_label_icon(parent, hmod, MenuIcon::Language, 16, 202);
     let lang_label_text = to_utf16(strings.label_language);
     let label4 = CreateWindowExW(
         0,
@@ -1754,7 +2003,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         lang_label_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         label_x,
-        166,
+        202,
         max_label,
         20,
         parent,
@@ -1774,7 +2023,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST as u32 | CBS_HASSTRINGS as u32
             | WS_VSCROLL as u32,
         right_x,
-        164,
+        200,
         right_w,
         200,
         parent,
@@ -1803,7 +2052,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         std::ptr::null(),
         WS_CHILD | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
         16,
-        224,
+        260,
         408,
         44,
         parent,
@@ -1824,7 +2073,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         ver_text.as_ptr(),
         WS_CHILD | WS_VISIBLE,
         16,
-        292,
+        328,
         200,
         20,
         parent,
@@ -1844,7 +2093,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
         client_w - 24 - 80,
-        292,
+        328,
         80,
         28,
         parent,
@@ -1874,7 +2123,8 @@ unsafe extern "system" fn options_wnd_proc(
             } else if code as u32 == BN_CLICKED
                 && (id == ID_OPT_HELP_AUTOSTART
                     || id == ID_OPT_HELP_DELAY
-                    || id == ID_OPT_HELP_EXCLUDE)
+                    || id == ID_OPT_HELP_EXCLUDE
+                    || id == ID_OPT_HELP_RUN_AS_ADMIN)
             {
                 // 问号图标点击:固定显示/隐藏说明(静态控件通知码 STN_CLICKED=0 与 BN_CLICKED 相同)
                 on_help_icon_click(hwnd, id);
@@ -1943,10 +2193,13 @@ unsafe fn save_options(hwnd: HWND) {
     let combo = GetDlgItem(hwnd, ID_OPT_COMBO_LANGUAGE as i32);
     let sel = SendMessageW(combo, CB_GETCURSEL, 0, 0) as usize;
     let lang = Lang::all().get(sel).copied().unwrap_or(Lang::Zh);
+    let admin_check = GetDlgItem(hwnd, ID_OPT_CHECK_RUN_AS_ADMIN as i32);
+    let want_admin = SendMessageW(admin_check, BM_GETCHECK, 0, 0) != 0;
     let cfg = config::Config {
         long_press_ms: ms,
         exclude_processes: exclude.clone(),
         language: lang.code().to_string(),
+        run_as_admin: want_admin,
     };
     if !config::save(&cfg, &path) {
         log_write("保存 config.toml 失败");
@@ -1954,35 +2207,99 @@ unsafe fn save_options(hwnd: HWND) {
         return;
     }
     log_write(&format!(
-        "保存设置: 延迟={ms}ms 排除={exclude:?} 语言={}",
+        "保存设置: 延迟={ms}ms 排除={exclude:?} 语言={} 管理员={want_admin}",
         lang.code()
     ));
     *LONG_PRESS_MS.lock() = ms;
     *EXCLUDE_PROCESSES.lock() = exclude;
     *LANGUAGE.lock() = lang;
     update_tray_tooltip();
+    let prev_admin = RUN_AS_ADMIN.load(Ordering::Relaxed);
+    RUN_AS_ADMIN.store(want_admin, Ordering::Relaxed);
 
-    // 开机启动:勾选与当前注册表一致则跳过,否则写入或删除
+    // 开机启动(与管理员模式联动):
+    // - 管理员模式:开机启动由计划任务承担,Run 键必须清除(防登录时双启动)
+    // - 普通模式:按勾选框写入/删除 Run 键
     let check = GetDlgItem(hwnd, ID_OPT_CHECK_AUTOSTART as i32);
-    let want_enabled = SendMessageW(check, BM_GETCHECK, 0, 0) != 0;
-    let need_write = want_enabled != is_autostart_enabled();
-    let ok = !need_write
-        || if want_enabled {
-            reg_write_value(
-                HKEY_CURRENT_USER,
-                AUTOSTART_KEY,
-                AUTOSTART_VALUE_NAME,
-                &current_exe_quoted(),
-            )
-        } else {
+    let want_autostart = SendMessageW(check, BM_GETCHECK, 0, 0) != 0;
+    let ok = if want_admin {
+        if is_autostart_enabled() {
             reg_delete_value(HKEY_CURRENT_USER, AUTOSTART_KEY, AUTOSTART_VALUE_NAME)
-        };
+        } else {
+            true
+        }
+    } else {
+        let need_write = want_autostart != is_autostart_enabled();
+        !need_write
+            || if want_autostart {
+                reg_write_value(
+                    HKEY_CURRENT_USER,
+                    AUTOSTART_KEY,
+                    AUTOSTART_VALUE_NAME,
+                    &current_exe_quoted(),
+                )
+            } else {
+                reg_delete_value(HKEY_CURRENT_USER, AUTOSTART_KEY, AUTOSTART_VALUE_NAME)
+            }
+    };
     if !ok {
         log_write("保存开机自启动设置失败");
         show_error(tr().err_save_autostart);
         return;
     }
+
+    // 管理员模式动作:开启(UAC 提权重启)或关闭(删任务 + 降权重启)
+    if want_admin == prev_admin {
+        // 状态未变化:仅刷新其他设置
+        DestroyWindow(hwnd);
+        return;
+    }
+    if want_admin {
+        if is_elevated() {
+            // 已提权:无需重启,静默确保任务存在
+            if !scheduled_task_exists() && !create_scheduled_task() {
+                log_write("创建开机提权启动计划任务失败");
+                show_error(tr().err_create_elevated_task);
+            }
+            DestroyWindow(hwnd);
+            return;
+        }
+        // 未提权:关面板 → UAC 提权重启;取消则回滚配置并提示
+        DestroyWindow(hwnd);
+        if restart_elevated() {
+            PostQuitMessage(0);
+        } else {
+            RUN_AS_ADMIN.store(false, Ordering::Relaxed);
+            let rollback = config::Config {
+                long_press_ms: *LONG_PRESS_MS.lock(),
+                exclude_processes: EXCLUDE_PROCESSES.lock().clone(),
+                language: LANGUAGE.lock().code().to_string(),
+                run_as_admin: false,
+            };
+            config::save(&rollback, &path);
+            log_write("用户取消 UAC,管理员模式回滚");
+            show_error(tr().err_uac_cancelled);
+        }
+        return;
+    }
+    // 关闭管理员模式:删任务 → 降权重启
     DestroyWindow(hwnd);
+    if is_elevated() {
+        if scheduled_task_exists() && !delete_scheduled_task() {
+            log_write("删除开机提权启动计划任务失败");
+            show_error(tr().err_delete_elevated_task);
+        }
+        if restart_unelevated() {
+            PostQuitMessage(0);
+        } else {
+            // 降级:任务已删、配置已写 false,继续以管理员运行,提示手动重启
+            show_error(tr().err_unelevate_failed);
+        }
+    } else if scheduled_task_exists() && !delete_scheduled_task() {
+        // 未提权却残留任务(罕见):无权限删除,提示用户
+        log_write("未提权删除计划任务失败");
+        show_error(tr().err_delete_elevated_task);
+    }
 }
 
 /// 以消息框展示致命错误
@@ -2404,6 +2721,7 @@ mod menu_icon_tests {
             MenuIcon::AutostartOff,
             MenuIcon::Options,
             MenuIcon::Exit,
+            MenuIcon::Shield,
         ] {
             let px = draw_menu_icon_pixels(kind);
             assert_eq!(px.len(), 16 * 16 * 4, "{kind:?} 尺寸应为 16x16x4");
@@ -2511,6 +2829,7 @@ mod menu_icon_tests {
             MenuIcon::Exit,
             MenuIcon::Clock,
             MenuIcon::Blocked,
+            MenuIcon::Shield,
         ] {
             let bmp = draw_menu_icon_pixels(kind);
             for i in (0..bmp.len()).step_by(4) {
@@ -2533,6 +2852,7 @@ mod menu_icon_tests {
 mod tray_raise_tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         FindWindowW, GW_HWNDPREV, GetWindow, PM_REMOVE, PeekMessageW, SW_MINIMIZE,
         WS_OVERLAPPEDWINDOW,
@@ -2570,10 +2890,16 @@ mod tray_raise_tests {
 
     #[test]
     fn tray_click_raises_open_options_panel() {
+        let _gate = TEST_WINDOW_LOCK.lock();
         unsafe {
             let hmod = GetModuleHandleW(std::ptr::null::<u16>());
-            assert!(register_window_class(hmod), "注册托盘窗口类");
-            assert!(register_options_window_class(hmod), "注册面板窗口类");
+            // 与 panel_layout_tests 并行运行时窗口类可能已被对方注册(类注册后进程内不注销)
+            let class_ok =
+                register_window_class(hmod) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(class_ok, "注册托盘窗口类");
+            let opt_class_ok =
+                register_options_window_class(hmod) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(opt_class_ok, "注册面板窗口类");
 
             let tray = create_hidden_window(hmod);
             assert!(!tray.is_null(), "创建隐藏窗口");
@@ -2636,6 +2962,134 @@ mod tray_raise_tests {
 
             DestroyWindow(cover);
             DestroyWindow(tray);
+        }
+    }
+}
+
+// ===== 回归测试:选项面板加行后布局不越界、控件不重叠 =====
+#[cfg(test)]
+mod panel_layout_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, PM_REMOVE, PeekMessageW};
+
+    fn pump(ms: u64) {
+        let start = Instant::now();
+        unsafe {
+            let mut msg: MSG = std::mem::zeroed();
+            while (start.elapsed().as_millis() as u64) < ms {
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn options_panel_layout_stays_in_bounds() {
+        let _gate = TEST_WINDOW_LOCK.lock();
+        unsafe {
+            let hmod = GetModuleHandleW(std::ptr::null::<u16>());
+            // 与 tray_raise_tests 并行运行时窗口类可能已被对方注册(类注册后进程内不注销)
+            let class_ok =
+                register_window_class(hmod) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(class_ok, "注册托盘窗口类");
+            let opt_class_ok =
+                register_options_window_class(hmod) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(opt_class_ok, "注册面板窗口类");
+            let tray = create_hidden_window(hmod);
+            open_options_panel(tray);
+            let opt = FindWindowW(to_utf16(OPTIONS_WINDOW_CLASS).as_ptr(), std::ptr::null());
+            assert!(!opt.is_null(), "选项面板应已创建");
+            pump(200);
+
+            // 客户区高度:保存按钮底(328+28=356)不得越界
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(opt, &mut rc);
+            assert!(rc.bottom > 356, "客户区高度不足: bottom={}", rc.bottom);
+
+            // 新控件必须存在
+            let admin_check = GetDlgItem(opt, ID_OPT_CHECK_RUN_AS_ADMIN as i32);
+            assert_ne!(admin_check, std::ptr::null_mut(), "缺少管理员勾选框");
+            assert_ne!(
+                GetDlgItem(opt, ID_OPT_HELP_RUN_AS_ADMIN as i32),
+                std::ptr::null_mut(),
+                "缺少管理员帮助问号"
+            );
+
+            // 关键控件边界:客户区原点屏幕坐标 + 控件矩形,断言不超出客户区
+            let mut origin: POINT = POINT { x: 0, y: 0 };
+            ClientToScreen(opt, &mut origin);
+            for (name, id) in [
+                ("管理员勾选框", ID_OPT_CHECK_RUN_AS_ADMIN),
+                ("保存按钮", ID_OPT_SAVE),
+                ("版本号", ID_OPT_VERSION),
+                ("帮助栏", ID_OPT_HELP_BAR),
+            ] {
+                let c = GetDlgItem(opt, id as i32);
+                assert_ne!(c, std::ptr::null_mut(), "{name} 控件缺失");
+                let mut cr: RECT = std::mem::zeroed();
+                GetWindowRect(c, &mut cr);
+                assert!(
+                    cr.left >= origin.x && cr.top >= origin.y,
+                    "{name} 超出客户区左上: left={} top={} origin=({},{})",
+                    cr.left,
+                    cr.top,
+                    origin.x,
+                    origin.y
+                );
+                assert!(
+                    cr.right <= origin.x + rc.right && cr.bottom <= origin.y + rc.bottom,
+                    "{name} 超出客户区右下: right={} bottom={} client=({},{})",
+                    cr.right,
+                    cr.bottom,
+                    origin.x + rc.right,
+                    origin.y + rc.bottom
+                );
+            }
+
+            // 管理员勾选框与"以管理员身份启动"标签不得重叠(标签右缘 < 勾选框左缘)
+            let label_w = GetTextExtentPoint32W_label(opt);
+            assert!(label_w > 0, "标签宽度测量失败");
+            // 布局公式: label_x=38, help_x=38+max_label+4, right_x=help_x+16+12
+            let right_x = 38 + label_w + 4 + 16 + 12;
+            let mut ar: RECT = std::mem::zeroed();
+            GetWindowRect(admin_check, &mut ar);
+            assert!(
+                origin.x + right_x <= ar.left,
+                "标签/问号与勾选框重叠: right_x={} check_left={}",
+                origin.x + right_x,
+                ar.left
+            );
+
+            DestroyWindow(opt);
+            DestroyWindow(tray);
+        }
+    }
+
+    /// 测量"以管理员身份启动"标签像素宽度(与 create_options_controls 同一测量方式)
+    unsafe fn GetTextExtentPoint32W_label(opt: HWND) -> i32 {
+        let dc = GetDC(opt);
+        let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+        let s = tr().label_run_as_admin;
+        let w = to_utf16(s);
+        let mut size: SIZE = std::mem::zeroed();
+        let ok = GetTextExtentPoint32W(
+            dc,
+            w.as_ptr(),
+            s.encode_utf16().count() as i32,
+            &mut size,
+        );
+        SelectObject(dc, old_font);
+        ReleaseDC(opt, dc);
+        if ok != 0 {
+            size.cx
+        } else {
+            0
         }
     }
 }

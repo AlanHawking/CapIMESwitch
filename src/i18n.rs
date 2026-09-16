@@ -116,12 +116,16 @@ pub struct Strings {
     // 选项面板
     pub panel_title: &'static str,
     pub label_autostart: &'static str,
+    /// 以管理员身份开机自启选项标签
+    pub label_run_as_admin: &'static str,
     pub label_delay: &'static str,
     pub label_exclude: &'static str,
     pub label_language: &'static str,
     pub help_autostart: &'static str,
     pub help_delay: &'static str,
     pub help_exclude: &'static str,
+    /// 以管理员身份启动的帮助说明(只述用途)
+    pub help_run_as_admin: &'static str,
     /// 版本号模板(传入版本号)
     pub version_template: &'static str,
     pub save: &'static str,
@@ -144,6 +148,14 @@ pub struct Strings {
     pub err_config_path: &'static str,
     pub err_save_failed: &'static str,
     pub err_save_autostart: &'static str,
+    /// 创建开机提权启动计划任务失败(非致命,提示后继续以管理员运行)
+    pub err_create_elevated_task: &'static str,
+    /// 删除开机提权启动计划任务失败
+    pub err_delete_elevated_task: &'static str,
+    /// UAC 被取消,管理员模式回滚
+    pub err_uac_cancelled: &'static str,
+    /// 无法自动降权重启
+    pub err_unelevate_failed: &'static str,
 }
 
 static ZH: Strings = Strings {
@@ -154,12 +166,14 @@ static ZH: Strings = Strings {
     tray_tooltip: "CapIMESwitch - CapsLock 智能切换",
     panel_title: "CapIMESwitch 选项",
     label_autostart: "开机启动",
+    label_run_as_admin: "以管理员身份启动",
     label_delay: "长按延迟(毫秒)",
     label_exclude: "排除程序",
     label_language: "语言",
     help_autostart: "勾选后开机自动运行本程序,状态与托盘菜单一致,保存时生效",
     help_delay: "短按 CapsLock(未达该毫秒数松开)切换输入法;长按(达到该毫秒数)切换大小写",
     help_exclude: "这些程序中 CapsLock 恢复原始行为,不切换输入法;多个程序用逗号或换行分隔",
+    help_run_as_admin: "以管理员身份开机自启,让 CapsLock 在管理员窗口中也能切换输入法",
     version_template: "版本 {}",
     save: "保存",
     err_instance_lock: "创建实例锁失败",
@@ -175,6 +189,10 @@ static ZH: Strings = Strings {
     err_config_path: "无法确定配置文件位置",
     err_save_failed: "保存设置失败",
     err_save_autostart: "保存开机自启动设置失败",
+    err_create_elevated_task: "创建开机提权启动计划任务失败,本会话仍以管理员运行",
+    err_delete_elevated_task: "删除开机提权启动计划任务失败",
+    err_uac_cancelled: "已取消提权,设置未生效",
+    err_unelevate_failed: "无法自动降权,请退出后以普通方式重新启动",
 };
 
 static EN: Strings = Strings {
@@ -185,12 +203,14 @@ static EN: Strings = Strings {
     tray_tooltip: "CapIMESwitch - Smart CapsLock switching",
     panel_title: "CapIMESwitch Options",
     label_autostart: "Autostart at login",
+    label_run_as_admin: "Run as administrator",
     label_delay: "Long press delay (ms)",
     label_exclude: "Excluded programs",
     label_language: "Language",
     help_autostart: "Launch automatically at login; state matches the tray menu and takes effect on save",
     help_delay: "Short press CapsLock (release before this many ms) switches IME; long press (reach this many ms) toggles CapsLock",
     help_exclude: "CapsLock keeps its original behavior in these programs and does not switch IME; separate programs with commas or newlines",
+    help_run_as_admin: "Auto-start at login as administrator, so CapsLock keeps working in elevated windows too",
     version_template: "Version {}",
     save: "Save",
     err_instance_lock: "Failed to create instance lock",
@@ -206,6 +226,10 @@ static EN: Strings = Strings {
     err_config_path: "Cannot determine config file location",
     err_save_failed: "Failed to save settings",
     err_save_autostart: "Failed to save autostart setting",
+    err_create_elevated_task: "Failed to create the elevated autostart task; this session keeps running as administrator",
+    err_delete_elevated_task: "Failed to remove the elevated autostart task",
+    err_uac_cancelled: "Elevation cancelled, changes not applied",
+    err_unelevate_failed: "Cannot restart at normal privileges; please exit and restart normally",
 };
 
 static JA: Strings = Strings {
@@ -216,12 +240,14 @@ static JA: Strings = Strings {
     tray_tooltip: "CapIMESwitch - CapsLock スマート切り替え",
     panel_title: "CapIMESwitch オプション",
     label_autostart: "ログイン時に自動起動",
+    label_run_as_admin: "管理者として実行",
     label_delay: "長押し遅延(ミリ秒)",
     label_exclude: "除外プログラム",
     label_language: "言語",
     help_autostart: "ログイン時に自動起動します。状態はトレイ メニューと一致し、保存時に有効になります",
     help_delay: "短押しの CapsLock(このミリ秒未満で離す)で入力方式を切り替え、長押し(このミリ秒以上)で大文字/小文字を切り替えます",
     help_exclude: "これらのプログラムでは CapsLock が元の動作に戻り、入力方式を切り替えません。複数のプログラムはカンマまたは改行で区切ります",
+    help_run_as_admin: "管理者権限でログイン時に自動起動し、管理者ウィンドウでも CapsLock を利用できます",
     version_template: "バージョン {}",
     save: "保存",
     err_instance_lock: "インスタンス ロックの作成に失敗しました",
@@ -237,6 +263,10 @@ static JA: Strings = Strings {
     err_config_path: "設定ファイルの場所を特定できません",
     err_save_failed: "設定の保存に失敗しました",
     err_save_autostart: "自動起動設定の保存に失敗しました",
+    err_create_elevated_task: "管理者権限の自動起動タスクの作成に失敗しました。このセッションは管理者として実行を続けます",
+    err_delete_elevated_task: "管理者権限の自動起動タスクの削除に失敗しました",
+    err_uac_cancelled: "権限昇格がキャンセルされました。設定は適用されません",
+    err_unelevate_failed: "通常権限で再起動できません。終了して通常の方法で再起動してください",
 };
 
 static KO: Strings = Strings {
@@ -247,12 +277,14 @@ static KO: Strings = Strings {
     tray_tooltip: "CapIMESwitch - CapsLock 스마트 전환",
     panel_title: "CapIMESwitch 옵션",
     label_autostart: "로그인 시 자동 시작",
+    label_run_as_admin: "관리자 권한으로 실행",
     label_delay: "길게 누름 지연(밀리초)",
     label_exclude: "제외 프로그램",
     label_language: "언어",
     help_autostart: "로그인 시 자동으로 실행됩니다. 상태는 트레이 메뉴와 일치하며 저장 시 적용됩니다",
     help_delay: "짧게 누른 CapsLock(이 밀리초 미만에 놓기)은 입력기를 전환하고, 길게 누르면(이 밀리초 이상) 대문자/소문자를 전환합니다",
     help_exclude: "이 프로그램들에서는 CapsLock이 원래 동작으로 돌아가 입력기를 전환하지 않습니다. 여러 프로그램은 쉼표 또는 줄바꿈으로 구분합니다",
+    help_run_as_admin: "관리자 권한으로 로그인 시 자동 시작되어 관리자 창에서도 CapsLock을 사용할 수 있습니다",
     version_template: "버전 {}",
     save: "저장",
     err_instance_lock: "인스턴스 잠금 생성 실패",
@@ -268,6 +300,10 @@ static KO: Strings = Strings {
     err_config_path: "구성 파일 위치를 확인할 수 없습니다",
     err_save_failed: "설정 저장 실패",
     err_save_autostart: "자동 시작 설정 저장 실패",
+    err_create_elevated_task: "관리자 권한 자동 시작 작업 생성 실패, 이 세션은 관리자 권한으로 계속 실행됩니다",
+    err_delete_elevated_task: "관리자 권한 자동 시작 작업 삭제 실패",
+    err_uac_cancelled: "권한 상승이 취소되어 설정이 적용되지 않았습니다",
+    err_unelevate_failed: "일반 권한으로 다시 시작할 수 없습니다. 종료 후 일반 방식으로 다시 시작하세요",
 };
 
 static FR: Strings = Strings {
@@ -278,12 +314,14 @@ static FR: Strings = Strings {
     tray_tooltip: "CapIMESwitch - Permutation intelligente de CapsLock",
     panel_title: "Options de CapIMESwitch",
     label_autostart: "Lancer au démarrage",
+    label_run_as_admin: "Exécuter en tant qu'administrateur",
     label_delay: "Délai d'appui long (ms)",
     label_exclude: "Programmes exclus",
     label_language: "Langue",
     help_autostart: "Lancement automatique à l'ouverture de session ; l'état correspond au menu de la barre d'état et s'applique lors de l'enregistrement",
     help_delay: "Un appui court sur CapsLock (relâché avant ce seuil en ms) permute la méthode de saisie ; un appui long (atteignant ce seuil) active/désactive les majuscules",
     help_exclude: "Dans ces programmes, CapsLock conserve son comportement d'origine et ne permute pas la méthode de saisie ; séparez les programmes par des virgules ou des sauts de ligne",
+    help_run_as_admin: "Démarrage automatique en tant qu'administrateur à l'ouverture de session, pour que CapsLock fonctionne aussi dans les fenêtres élevées",
     version_template: "Version {}",
     save: "Enregistrer",
     err_instance_lock: "Échec de la création du verrou d'instance",
@@ -299,6 +337,10 @@ static FR: Strings = Strings {
     err_config_path: "Impossible de déterminer l'emplacement du fichier de configuration",
     err_save_failed: "Échec de l'enregistrement des paramètres",
     err_save_autostart: "Échec de l'enregistrement du réglage de démarrage automatique",
+    err_create_elevated_task: "Échec de la création de la tâche de démarrage élevé ; cette session continue en tant qu'administrateur",
+    err_delete_elevated_task: "Échec de la suppression de la tâche de démarrage élevé",
+    err_uac_cancelled: "Élévation annulée, réglages non appliqués",
+    err_unelevate_failed: "Impossible de redémarrer à privilèges normaux ; quittez et redémarrez normalement",
 };
 
 static DE: Strings = Strings {
@@ -309,12 +351,14 @@ static DE: Strings = Strings {
     tray_tooltip: "CapIMESwitch - Intelligente CapsLock-Umschaltung",
     panel_title: "CapIMESwitch-Optionen",
     label_autostart: "Beim Anmelden starten",
+    label_run_as_admin: "Als Administrator ausführen",
     label_delay: "Drückverzögerung (ms)",
     label_exclude: "Ausgeschlossene Programme",
     label_language: "Sprache",
     help_autostart: "Automatisch bei der Anmeldung starten; der Status entspricht dem Tray-Menü und wird beim Speichern wirksam",
     help_delay: "Kurzer Druck auf CapsLock (vor dieser ms-Zahl loslassen) wechselt die Eingabemethode; langer Druck (diese ms-Zahl erreichen) schaltet Groß-/Kleinschreibung um",
     help_exclude: "In diesen Programmen behält CapsLock sein ursprüngliches Verhalten und wechselt die Eingabemethode nicht; Programme mit Kommas oder Zeilenumbrüchen trennen",
+    help_run_as_admin: "Automatischer Start als Administrator bei der Anmeldung, damit CapsLock auch in erhöhten Fenstern funktioniert",
     version_template: "Version {}",
     save: "Speichern",
     err_instance_lock: "Instance-Sperre konnte nicht erstellt werden",
@@ -330,6 +374,10 @@ static DE: Strings = Strings {
     err_config_path: "Speicherort der Konfigurationsdatei kann nicht ermittelt werden",
     err_save_failed: "Einstellungen konnten nicht gespeichert werden",
     err_save_autostart: "Automatische Starteinstellung konnte nicht gespeichert werden",
+    err_create_elevated_task: "Erstellen der erhöhten Autostart-Aufgabe fehlgeschlagen; diese Sitzung läuft weiter als Administrator",
+    err_delete_elevated_task: "Entfernen der erhöhten Autostart-Aufgabe fehlgeschlagen",
+    err_uac_cancelled: "Erhöhung abgebrochen, Änderungen nicht angewendet",
+    err_unelevate_failed: "Neustart mit normalen Rechten nicht möglich; beenden und normal neu starten",
 };
 
 static ES: Strings = Strings {
@@ -340,12 +388,14 @@ static ES: Strings = Strings {
     tray_tooltip: "CapIMESwitch - Cambio inteligente de CapsLock",
     panel_title: "Opciones de CapIMESwitch",
     label_autostart: "Iniciar al iniciar sesión",
+    label_run_as_admin: "Ejecutar como administrador",
     label_delay: "Retardo de pulsación larga (ms)",
     label_exclude: "Programas excluidos",
     label_language: "Idioma",
     help_autostart: "Se inicia automáticamente al iniciar sesión; el estado coincide con el menú de la bandeja y se aplica al guardar",
     help_delay: "La pulsación corta de CapsLock (soltar antes de este número de ms) cambia el método de entrada; la pulsación larga (alcanzar este número de ms) activa/desactiva las mayúsculas",
     help_exclude: "En estos programas, CapsLock conserva su comportamiento original y no cambia el método de entrada; separe varios programas con comas o saltos de línea",
+    help_run_as_admin: "Inicio automático como administrador al iniciar sesión, para que CapsLock también funcione en ventanas elevadas",
     version_template: "Versión {}",
     save: "Guardar",
     err_instance_lock: "Error al crear el bloqueo de instancia",
@@ -361,6 +411,10 @@ static ES: Strings = Strings {
     err_config_path: "No se puede determinar la ubicación del archivo de configuración",
     err_save_failed: "Error al guardar los ajustes",
     err_save_autostart: "Error al guardar el ajuste de inicio automático",
+    err_create_elevated_task: "Error al crear la tarea de inicio elevada; esta sesión continúa como administrador",
+    err_delete_elevated_task: "Error al eliminar la tarea de inicio elevada",
+    err_uac_cancelled: "Elevación cancelada, cambios no aplicados",
+    err_unelevate_failed: "No se puede reiniciar con privilegios normales; salga y reinicie normalmente",
 };
 
 static RU: Strings = Strings {
@@ -371,12 +425,14 @@ static RU: Strings = Strings {
     tray_tooltip: "CapIMESwitch - Умное переключение CapsLock",
     panel_title: "Настройки CapIMESwitch",
     label_autostart: "Запускать при входе",
+    label_run_as_admin: "Запуск от имени администратора",
     label_delay: "Задержка длинного нажатия (мс)",
     label_exclude: "Исключённые программы",
     label_language: "Язык",
     help_autostart: "Автозапуск при входе в систему; состояние соответствует меню в трее и применяется при сохранении",
     help_delay: "Короткое нажатие CapsLock (отпустить раньше этого числа мс) переключает метод ввода; длинное (достичь этого числа мс) включает/выключает заглавные буквы",
     help_exclude: "В этих программах CapsLock сохраняет исходное поведение и не переключает метод ввода; разделяйте программы запятыми или переводами строк",
+    help_run_as_admin: "Автозапуск от имени администратора при входе, чтобы CapsLock работал и в окнах с повышенными правами",
     version_template: "Версия {}",
     save: "Сохранить",
     err_instance_lock: "Не удалось создать блокировку экземпляра",
@@ -392,6 +448,10 @@ static RU: Strings = Strings {
     err_config_path: "Не удалось определить расположение файла конфигурации",
     err_save_failed: "Не удалось сохранить настройки",
     err_save_autostart: "Не удалось сохранить настройку автозапуска",
+    err_create_elevated_task: "Не удалось создать задачу автозапуска с повышенными правами; этот сеанс продолжит работу от имени администратора",
+    err_delete_elevated_task: "Не удалось удалить задачу автозапуска с повышенными правами",
+    err_uac_cancelled: "Повышение прав отменено, изменения не применены",
+    err_unelevate_failed: "Не удалось перезапустить с обычными правами; выйдите и перезапустите обычным способом",
 };
 
 #[cfg(test)]
@@ -473,12 +533,14 @@ mod tests {
                 s.tray_tooltip,
                 s.panel_title,
                 s.label_autostart,
+                s.label_run_as_admin,
                 s.label_delay,
                 s.label_exclude,
                 s.label_language,
                 s.help_autostart,
                 s.help_delay,
                 s.help_exclude,
+                s.help_run_as_admin,
                 s.version_template,
                 s.save,
                 s.err_instance_lock,
@@ -494,6 +556,10 @@ mod tests {
                 s.err_config_path,
                 s.err_save_failed,
                 s.err_save_autostart,
+                s.err_create_elevated_task,
+                s.err_delete_elevated_task,
+                s.err_uac_cancelled,
+                s.err_unelevate_failed,
             ] {
                 assert!(!field.is_empty(), "{lang:?} 存在空字符串");
             }
