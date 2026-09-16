@@ -14,7 +14,7 @@ mod i18n;
 
 use i18n::Lang;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HWND, LPARAM,
@@ -26,8 +26,7 @@ use windows_sys::Win32::Graphics::Gdi::{
     DEFAULT_GUI_FONT, GetDC, GetStockObject, GetTextExtentPoint32W, ReleaseDC, SelectObject,
     SetBkMode, SetTextColor, TRANSPARENT, WHITE_BRUSH, BI_RGB, BITMAPINFO, BITMAPINFOHEADER,
     DIB_RGB_COLORS, CreateDIBSection, CreateBitmap, DeleteObject, HBRUSH, HBITMAP, HDC,
-    BeginPaint, CreateSolidBrush, DrawTextW, DT_CENTER, DT_SINGLELINE, DT_VCENTER, EndPaint,
-    InflateRect, InvalidateRect, PAINTSTRUCT, RoundRect, UpdateWindow,
+    CreateSolidBrush, DrawTextW, DT_CENTER, DT_SINGLELINE, DT_VCENTER, InflateRect, RoundRect,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -53,7 +52,7 @@ use windows_sys::Win32::UI::Shell::{
     NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CallNextHookEx,
+    AppendMenuW, BN_CLICKED, BS_AUTOCHECKBOX, BS_OWNERDRAW, CallNextHookEx,
     GetForegroundWindow, GetWindowThreadProcessId,
     CreateIconFromResource, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyIcon, ICONINFO,
@@ -76,16 +75,20 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, MENUITEMINFOW, MSG,
     SetMenuItemInfoW, TPM_RETURNCMD, TPM_RIGHTBUTTON, WH_KEYBOARD_LL, WM_APP,
     WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
-    WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT,
+    WM_MOUSEMOVE, WM_DRAWITEM,
         WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WS_CAPTION,
     WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
     WNDCLASSW,
 };
+use windows_sys::Win32::UI::Controls::{ODS_SELECTED, ODT_BUTTON, DRAWITEMSTRUCT};
+
 /// BM_SETCHECK / BM_GETCHECK 消息(0.59 未导出控件 API,用消息字面量)
 const BM_SETCHECK: u32 = 0x00F1;
 const BM_GETCHECK: u32 = 0x00F0;
 /// WM_MOUSELEAVE 未在 0.59 导出,用消息字面量
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+
 /// 按钮勾选状态值
 const BST_CHECKED: usize = 1;
 
@@ -182,10 +185,6 @@ static OPTIONS_HWND: AtomicUsize = AtomicUsize::new(0);
 static HELP_PINNED: Mutex<Option<usize>> = Mutex::new(None);
 /// Static 类原始窗口过程(问号图标的子类化链回目标)
 static ORIG_STATIC_PROC: AtomicUsize = AtomicUsize::new(0);
-/// 保存按钮自绘状态:0 正常 / 1 悬停 / 2 按下
-static SAVE_BTN_STATE: AtomicU8 = AtomicU8::new(0);
-/// 保存按钮原始窗口过程(子类化链回目标)
-static ORIG_SAVE_PROC: AtomicUsize = AtomicUsize::new(0);
 /// 当前语言的全部用户可见字符串(锁在返回后立即释放,引用为 'static)
 fn tr() -> &'static i18n::Strings {
     LANGUAGE.lock().strings()
@@ -1643,81 +1642,11 @@ unsafe extern "system" fn help_icon_subproc(
         }
     }
 }
-/// 子类化保存按钮:接管自绘,保留其余消息走原始过程
-unsafe fn subclass_save_button(btn: HWND) {
-    if ORIG_SAVE_PROC.load(Ordering::Relaxed) == 0 {
-        let cls = GetClassLongPtrW(btn, GCLP_WNDPROC) as usize;
-        ORIG_SAVE_PROC.store(cls, Ordering::Relaxed);
-    }
-    SetWindowLongPtrW(btn, GWLP_WNDPROC, save_btn_proc as *const () as isize);
-}
 
-/// 保存按钮子类化窗口过程:自绘扁平按钮,跟踪悬停/按下状态
-unsafe extern "system" fn save_btn_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_PAINT => {
-            let mut ps: PAINTSTRUCT = std::mem::zeroed();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            draw_save_button(hdc, hwnd, SAVE_BTN_STATE.load(Ordering::Relaxed));
-            EndPaint(hwnd, &ps);
-            0
-        }
-        WM_MOUSEMOVE => {
-            if SAVE_BTN_STATE.load(Ordering::Relaxed) != 1 {
-                track_mouse_leave(hwnd);
-                SAVE_BTN_STATE.store(1, Ordering::Relaxed);
-                redraw_button(hwnd);
-            }
-            0
-        }
-        WM_MOUSELEAVE => {
-            SAVE_BTN_STATE.store(0, Ordering::Relaxed);
-            redraw_button(hwnd);
-            0
-        }
-        WM_LBUTTONDOWN => {
-            SAVE_BTN_STATE.store(2, Ordering::Relaxed);
-            redraw_button(hwnd);
-            call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam)
-        }
-        WM_LBUTTONUP => {
-            SAVE_BTN_STATE.store(1, Ordering::Relaxed);
-            redraw_button(hwnd);
-            call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam)
-        }
-        _ => call_original(ORIG_SAVE_PROC.load(Ordering::Relaxed) as isize, hwnd, msg, wparam, lparam),
-    }
-}
 
-/// 转调子类化前的原始窗口过程
-unsafe fn call_original(original: isize, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if original == 0 {
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-    }
-    CallWindowProcW(std::mem::transmute(original), hwnd, msg, wparam, lparam)
-}
-
-/// 登记鼠标离开跟踪(收到 WM_MOUSELEAVE 后置回正常态)
-unsafe fn track_mouse_leave(hwnd: HWND) {
-    let mut tme: TRACKMOUSEEVENT = std::mem::zeroed();
-    tme.cbSize = std::mem::size_of::<TRACKMOUSEEVENT>() as u32;
-    tme.dwFlags = TME_LEAVE;
-    tme.hwndTrack = hwnd;
-    TrackMouseEvent(&mut tme);
-}
-
-/// 触发按钮重绘
-unsafe fn redraw_button(hwnd: HWND) {
-    InvalidateRect(hwnd, std::ptr::null(), 0);
-    UpdateWindow(hwnd);
-}
-
-/// 自绘保存按钮:品牌蓝圆角扁平钮,分正常/悬停/按下三态,白色文字居中
+/// 自绘保存按钮:品牌蓝圆角扁平钮(BS_OWNERDRAW,父窗口 WM_DRAWITEM 调用)。
+/// state: 0 正常 / 2 按下 / 1 悬停(兼容旧值,owner-draw 未使用——按下由系统
+/// itemState 判定,悬停如需要可后续接 ODS_HOTLIGHT)。白色文字居中。
 unsafe fn draw_save_button(hdc: HDC, hwnd: HWND, state: u8) {
     let mut rc: RECT = std::mem::zeroed();
     GetClientRect(hwnd, &mut rc);
@@ -2142,12 +2071,14 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     }
 
     // 保存按钮(右下角,右/下边距 24)
+    // BS_OWNERDRAW:自绘由父窗口 WM_DRAWITEM 完成,系统不再绘制任何 pressed/focus
+    // 视觉。若用普通按钮自绘需拦截 WM_LBUTTONDOWN 的原始绘制,按下会闪现系统样式。
     let save_label = to_utf16(strings.save);
     let save = CreateWindowExW(
         0,
         button_class.as_ptr(),
         save_label.as_ptr(),
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW as u32,
         client.right - 24 - 80,
         328,
         80,
@@ -2159,7 +2090,6 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     );
     if !save.is_null() {
         set_control_font(save);
-        subclass_save_button(save);
     }
 }
 
@@ -2187,6 +2117,21 @@ unsafe extern "system" fn options_wnd_proc(
             }
             0
         }
+        // 保存按钮为 BS_OWNERDRAW:所有绘制(含按下/悬停/焦点)均由父窗口这里完成,
+        // 系统不绘制任何 pressed/focus 视觉,彻底避免按下闪现系统按钮样式。
+        WM_DRAWITEM => {
+            let dis = lparam as *const DRAWITEMSTRUCT;
+            if !dis.is_null() {
+                let dis = &*dis;
+                if dis.CtlType == ODT_BUTTON && dis.CtlID == ID_OPT_SAVE as u32 {
+                    // ODS_SELECTED=按下;其余恢复 normal。focus 不额外描边,保持扁平外观。
+                    let state = if dis.itemState & ODS_SELECTED != 0 { 2 } else { 0 };
+                    draw_save_button(dis.hDC, dis.hwndItem, state);
+                }
+            }
+            0
+        }
+
         // 标签/说明文字绘制:白色背景融入面板,说明文字用灰色与主标签区分
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
             let hdc = wparam as HDC;
@@ -3029,7 +2974,9 @@ mod panel_layout_tests {
     use std::time::{Duration, Instant};
     use windows_sys::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
     use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, PM_REMOVE, PeekMessageW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowLongW, GetWindowRect, GWL_STYLE, PM_REMOVE, PeekMessageW,
+    };
 
     fn pump(ms: u64) {
         let start = Instant::now();
@@ -3213,5 +3160,58 @@ mod panel_layout_tests {
         }
         *LANGUAGE.lock() = prev_lang;
     }
+
+
+    /// 回归:保存按钮必须为 BS_OWNERDRAW。按下视觉由父窗口 WM_DRAWITEM 统一绘制,
+    /// 系统不再自绘 pressed/focus,否则按下/长按时会闪现系统标准按钮样式。
+    #[test]
+    fn save_button_is_owner_draw() {
+        let _gate = TEST_WINDOW_LOCK.lock();
+        unsafe {
+            let hmod = GetModuleHandleW(std::ptr::null::<u16>());
+            let opt_class_ok = register_options_window_class(hmod)
+                || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(opt_class_ok, "注册面板窗口类");
+            let tray = create_hidden_window(hmod);
+            open_options_panel(tray);
+            let opt = FindWindowW(to_utf16(OPTIONS_WINDOW_CLASS).as_ptr(), std::ptr::null());
+            assert!(!opt.is_null(), "选项面板应已创建");
+            pump(100);
+
+            let save = GetDlgItem(opt, ID_OPT_SAVE as i32);
+            assert_ne!(save, std::ptr::null_mut(), "保存按钮缺失");
+            // GWL_STYLE 低比特为 BS_* 类型:BS_OWNERDRAW=11(0x0000000B)
+            let style = GetWindowLongW(save, GWL_STYLE) as u32;
+            assert_eq!(
+                style & 0x0F,
+                BS_OWNERDRAW as u32,
+                "保存按钮应为 BS_OWNERDRAW, 实际 style=0x{style:08X}"
+            );
+
+            // 触发一次 WM_DRAWITEM:父窗口 options_wnd_proc 必须消费自绘(返回 0),
+            // 且不得抛出(模拟按下态 ODS_SELECTED)
+            let mut dis: DRAWITEMSTRUCT = std::mem::zeroed();
+            dis.CtlType = ODT_BUTTON;
+            dis.CtlID = ID_OPT_SAVE as u32;
+            dis.hwndItem = save;
+            dis.itemState = ODS_SELECTED;
+            let hdc = GetDC(opt);
+            assert!(!hdc.is_null(), "获取面板 DC");
+            dis.hDC = hdc;
+            dis.rcItem = RECT {
+                left: 0,
+                top: 0,
+                right: 80,
+                bottom: 28,
+            };
+            let ret = SendMessageW(opt, WM_DRAWITEM, 0, &dis as *const DRAWITEMSTRUCT as LPARAM);
+            ReleaseDC(opt, hdc);
+            assert_eq!(ret, 0, "父窗口应消费 WM_DRAWITEM 自绘");
+
+            DestroyWindow(opt);
+            DestroyWindow(tray);
+        }
+    }
+
 
 }
