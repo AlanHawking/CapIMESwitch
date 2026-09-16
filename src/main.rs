@@ -1449,18 +1449,26 @@ unsafe fn open_options_panel(owner: HWND) {
     let hmod = GetModuleHandleW(std::ptr::null::<u16>());
     let class_name = to_utf16(OPTIONS_WINDOW_CLASS);
     let title = to_utf16(tr().panel_title);
-    const W: i32 = 440;
     const H: i32 = 420;
+    // 面板宽度随当前语言最宽标签自适应:输入列必须保住 PANEL_MIN_INPUT_W,
+    // 过长标签(俄语等)通过加宽面板容纳,而非截断或把输入列挤出面板
+    let max_label = measure_max_label_width();
+    // 所需客户区宽 = 左缘16 + 图标16/间隙6 后的 label_x + 标签 + 问号(4+16) + 列距12 + 输入列 + 右缘16
+    let need_client = (16 + 16 + 6) + max_label + (4 + 16 + 12) + PANEL_MIN_INPUT_W + 16;
+    let win_w = (need_client + PANEL_NONCLIENT_W).max(PANEL_MIN_W);
     let sw = GetSystemMetrics(SM_CXSCREEN);
     let sh = GetSystemMetrics(SM_CYSCREEN);
+    // 宽度不超出当前屏幕(多显示器取主屏校验,极端窄屏时宁可被 create_options_controls 收缩标签)
+    let win_w = win_w.min(sw);
+
     let hwnd = CreateWindowExW(
         0,
         class_name.as_ptr(),
         title.as_ptr(),
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        (sw - W) / 2,
+        (sw - win_w) / 2,
         (sh - H) / 2,
-        W,
+        win_w,
         H,
         owner,
         std::ptr::null_mut(),
@@ -1741,6 +1749,85 @@ unsafe fn draw_save_button(hdc: HDC, hwnd: HWND, state: u8) {
     SelectObject(hdc, old_font);
 }
 
+/// 输入列(勾选框/延迟输入框/排除框/下拉框)需保有的最小宽度(像素)。
+/// 过长的选项标签(俄语等)不得把输入列挤出面板,取面板自适应宽度与标签上限的较小者。
+const PANEL_MIN_INPUT_W: i32 = 200;
+/// 面板外框相对于客户区的额外宽度(左右边框之和)。
+const PANEL_NONCLIENT_W: i32 = 16;
+/// 面板外框最小宽度(保持既有紧凑尺寸)。
+const PANEL_MIN_W: i32 = 440;
+
+/// 测量当前语言下最宽标签的像素宽度(与实际控件相同字体/DPI,
+/// GetDC(NULL) 取主屏 DC——面板按主屏居中,DPI 一致)。
+/// 全部测量失败时回退固定宽度 130。
+unsafe fn measure_max_label_width() -> i32 {
+    let dc = GetDC(std::ptr::null_mut());
+    let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    let strings = tr();
+    let titles = [
+        strings.label_autostart,
+        strings.label_run_as_admin,
+        strings.label_delay,
+        strings.label_exclude,
+        strings.label_language,
+    ];
+    let mut text_size: SIZE = std::mem::zeroed();
+    let mut max_label = 0i32;
+    for title in titles {
+        if GetTextExtentPoint32W(
+            dc,
+            to_utf16(title).as_ptr(),
+            title.encode_utf16().count() as i32,
+            &mut text_size,
+        ) != 0
+        {
+            max_label = max_label.max(text_size.cx);
+        }
+    }
+    SelectObject(dc, old_font);
+    ReleaseDC(std::ptr::null_mut(), dc);
+    if max_label <= 0 {
+        max_label = 130;
+    }
+    max_label
+}
+
+/// 选项面板横向布局计算结果。
+struct OptionsLayout {
+    max_label: i32,
+    help_x: i32,
+    right_x: i32,
+    right_w: i32,
+}
+
+/// 依据客户区宽与最宽标签像素宽计算面板横向布局。
+/// 输入列必须保住 PANEL_MIN_INPUT_W:过长的标签(俄语等)会被收缩到
+/// 输入列最小宽之前的余量,绝不把输入控件挤出面板右缘。
+fn compute_options_layout(client_w: i32, max_label_in: i32) -> OptionsLayout {
+    const ICON_W: i32 = 16;
+    const ICON_GAP: i32 = 6;
+    const HELP_W: i32 = 16;
+    const HELP_GAP: i32 = 4;
+    const COL_GAP: i32 = 12;
+    let label_x = 16 + ICON_W + ICON_GAP;
+    let label_cap = client_w - 16 - label_x - (HELP_GAP + HELP_W + COL_GAP) - PANEL_MIN_INPUT_W;
+    let max_label = if label_cap > 0 && max_label_in > label_cap {
+        label_cap
+    } else {
+        max_label_in
+    };
+    let help_x = label_x + max_label + HELP_GAP;
+    let right_x = help_x + HELP_W + COL_GAP;
+    // 输入列已由 label_cap 保证不为负,这里 max(0) 仅作兜底防极端情况
+    let right_w = (client_w - 16 - right_x).max(0);
+    OptionsLayout {
+        max_label,
+        help_x,
+        right_x,
+        right_w,
+    }
+}
+
 /// 创建选项面板子控件。
 /// 布局:左侧固定宽度名称列(左对齐)+ 问号帮助图标 + 右侧占满剩余空间的输入列;
 /// 说明文字默认隐藏,悬浮/点击问号时通过工具提示显示;版本号位于底部左侧。
@@ -1752,52 +1839,21 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
     let strings = tr();
 
     // 运行时测量最宽标题的像素宽度(按实际字体/DPI),左侧列宽随内容而定
-    let dc = GetDC(parent);
-    let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-    let mut text_size: SIZE = std::mem::zeroed();
-    let mut max_label = 0i32;
-    for title in [
-        strings.label_autostart,
-        strings.label_run_as_admin,
-        strings.label_delay,
-        strings.label_exclude,
-        strings.label_language,
-    ] {
-        let w = to_utf16(title);
-        if GetTextExtentPoint32W(
-            dc,
-            w.as_ptr(),
-            title.encode_utf16().count() as i32,
-            &mut text_size,
-        ) != 0
-        {
-            max_label = max_label.max(text_size.cx);
-        }
-    }
-    // 全部测量失败时才用固定兜底宽度(避免兜底值污染真实测量)
-    if max_label <= 0 {
-        max_label = 130;
-    }
-    SelectObject(dc, old_font);
-    ReleaseDC(parent, dc);
-    // 布局基准为窗口客户区宽度(440 是含边框的外框宽,客户区小约 16px,
-    // 若不修正,右侧控件会贴着客户区右缘,看起来没有边距)
+    let max_label = measure_max_label_width();
     let mut client: RECT = std::mem::zeroed();
     GetClientRect(parent, &mut client);
-    let client_w = client.right;
-    // 图标 16..32,标签 38..38+max_label,问号 16x16(+4 间距),输入列(+12 间距)占满至右缘 16
-    const ICON_W: i32 = 16;
-    const ICON_GAP: i32 = 6;
-    const HELP_W: i32 = 16;
-    const HELP_GAP: i32 = 4;
-    const COL_GAP: i32 = 12;
-    let label_x = 16 + ICON_W + ICON_GAP;
-    let help_x = label_x + max_label + HELP_GAP;
-    let right_x = help_x + HELP_W + COL_GAP;
-    let right_w = client_w - 16 - right_x;
+    // 输入列必须保住最小宽度:过长标签(俄语等)被 compute_options_layout 收缩,
+    // 或面板整体加宽,绝不把输入控件挤出面板右缘
+    let lay = compute_options_layout(client.right, max_label);
+    let label_x = 16 + 16 + 6; // 左缘16 + 图标16 + 间隙6
+    let help_x = lay.help_x;
+    let right_x = lay.right_x;
+    let right_w = lay.right_w;
     log_write(&format!(
-        "选项面板布局: 客户区宽={client_w} 标题宽={max_label} 问号x={help_x} 输入列x={right_x} 宽={right_w}"
+        "选项面板布局: 客户区宽={} 标题宽={} 问号x={help_x} 输入列x={right_x} 宽={right_w}",
+        client.right, lay.max_label
     ));
+
 
     // 行 1:名称(左对齐)+ 问号 + 无字勾选框
     create_label_icon(parent, hmod, MenuIcon::Autostart, 16, 22);
@@ -2092,7 +2148,7 @@ unsafe fn create_options_controls(parent: HWND, hmod: *mut core::ffi::c_void) {
         button_class.as_ptr(),
         save_label.as_ptr(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
-        client_w - 24 - 80,
+        client.right - 24 - 80,
         328,
         80,
         28,
@@ -3092,4 +3148,70 @@ mod panel_layout_tests {
             0
         }
     }
+
+    /// 回归:compute_options_layout 必须保证输入列最小宽度(RU 超长标签不挤掉控件)
+    #[test]
+    fn layout_never_shrinks_input_below_min() {
+        // 模拟客户区 424(440 外框);max_label 远超任何语言的实测宽度
+        let lay = compute_options_layout(424, 10_000);
+        assert!(
+            lay.right_w >= PANEL_MIN_INPUT_W,
+            "输入列宽 {} 应至少 PANEL_MIN_INPUT_W={}",
+            lay.right_w,
+            PANEL_MIN_INPUT_W
+        );
+        // 标签列被收缩,不再以原始超长宽度铺开
+        assert!(lay.max_label < 10_000, "过宽标签应被收缩");
+        // 客户区过窄(极端窄屏)时输入列不为负
+        let narrow = compute_options_layout(120, 5_000);
+        assert!(narrow.right_w >= 0, "窄屏输入列不应为负: {}", narrow.right_w);
+    }
+
+    /// 回归:俄语(mark_as_admin 标签极长)打开面板后输入控件仍在客户区内
+    #[test]
+    fn russian_panel_keeps_inputs_in_bounds() {
+        let _gate = TEST_WINDOW_LOCK.lock();
+        let prev_lang = *LANGUAGE.lock();
+        *LANGUAGE.lock() = Lang::Ru;
+        unsafe {
+            let hmod = GetModuleHandleW(std::ptr::null::<u16>());
+            let opt_class_ok = register_options_window_class(hmod)
+                || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+            assert!(opt_class_ok, "注册面板窗口类");
+            let tray = create_hidden_window(hmod);
+            open_options_panel(tray);
+            let opt = FindWindowW(to_utf16(OPTIONS_WINDOW_CLASS).as_ptr(), std::ptr::null());
+            assert!(!opt.is_null(), "选项面板应已创建");
+            pump(200);
+
+            // 输入列最左控件(语言下拉框右侧),验证其右缘不超客户区右缘
+            let mut origin: POINT = POINT { x: 0, y: 0 };
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(opt, &mut rc);
+            ClientToScreen(opt, &mut origin);
+            // 语言下拉框是唯一会随列宽自适应变化宽度的输入控件
+            let combo = GetDlgItem(opt, ID_OPT_COMBO_LANGUAGE as i32);
+            assert_ne!(combo, std::ptr::null_mut(), "语言下拉框缺失");
+            let mut cr: RECT = std::mem::zeroed();
+            GetWindowRect(combo, &mut cr);
+            assert!(
+                cr.right <= origin.x + rc.right,
+                "俄语下拉框超出客户区右缘: right={} bound={}",
+                cr.right,
+                origin.x + rc.right
+            );
+            // 输入列保持足够宽(≥ 最小输入列宽),未被长标签挤掉
+            assert!(
+                cr.right - cr.left >= PANEL_MIN_INPUT_W,
+                "俄语输入列过窄: 宽={} 期望 ≥ {}",
+                cr.right - cr.left,
+                PANEL_MIN_INPUT_W
+            );
+
+            DestroyWindow(opt);
+            DestroyWindow(tray);
+        }
+        *LANGUAGE.lock() = prev_lang;
+    }
+
 }
