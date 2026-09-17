@@ -73,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File smoke.ps1
 
 ## 关键实现约定
 
-- **无窗口应用**: `#![windows_subsystem = "windows"]`;隐藏窗口类名 `CapIMESwitchTrayWindow`,接收托盘回调与 `TaskbarCreated`(资源管理器重启后重建托盘图标)
+- **无窗口应用**: `#![windows_subsystem = "windows"]`;隐藏窗口类名 `CapIMESwitchTrayWindow`,接收托盘回调与 `TaskbarCreated`(资源管理器重启后重建托盘图标)。登录时 Explorer 通知区域未就绪导致 `Shell_NotifyIconW` 返回 E_FAIL 属预期竞态:托盘添加失败不致命,启动 `TRAY_RETRY_TIMER_ID` 定时器(2s)自动补建,键盘钩子照常安装
 - **单实例**: 命名互斥体 `CapIMESwitch_SingleInstance`,重复启动时弹错误框退出;setup.iss 的 `AppMutex` 与之一致,安装器可感知运行中状态
 - **状态机**: 短按 <阈值(默认 500ms,选项面板可调 100-5000ms)→ `SwitchIme`;长按 ≥阈值(SetTimer 到期)→ `ToggleCapsLock`;按住期间按其他键 → `Cancelled`,注入事件不进入状态机(以 `INJECTED` 标志过滤)
 - **自启动**: 普通模式走 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值名 `CapIMESwitch`,托盘菜单勾选切换;卸载时 setup.iss 的 `[Code]` 段删除该值。提权模式(面板「以管理员身份启动」勾选)改用计划任务 `CapIMESwitchElevated`(`schtasks /SC ONLOGON /RL HIGHEST`,仅提权上下文可创建/删除),登录时静默提权启动,解决 UIPI 导致管理员窗口内钩子失效;两模式互斥,提权模式下 Run 键强制清除

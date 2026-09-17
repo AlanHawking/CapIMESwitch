@@ -2,7 +2,7 @@
 ; 编译:ISCC.exe installer\setup.iss
 
 #define MyAppName "CapIMESwitch"
-#define MyAppVersion "0.5.1"
+#define MyAppVersion "0.5.2"
 #define MyAppPublisher "CapIMESwitch"
 #define MyAppExeName "cap-ime-switch.exe"
 

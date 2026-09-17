@@ -96,6 +96,10 @@ use caps::{Action, CapsWatcher};
 
 /// SetTimer 定时器 id
 const CAPS_TIMER_ID: usize = 1;
+/// 托盘图标补建重试定时器 id(登录时托盘区域未就绪的竞态兜底)
+const TRAY_RETRY_TIMER_ID: usize = 2;
+/// 托盘图标补建重试间隔(毫秒)
+const TRAY_RETRY_MS: u32 = 2000;
 /// 托盘图标 uID
 const TRAY_ICON_ID: u32 = 1;
 /// 托盘回调消息(WM_APP + 1)
@@ -387,13 +391,16 @@ fn main() {
             Ordering::Relaxed,
         );
 
+        // 登录/开机阶段 Explorer 通知区域可能尚未就绪,Shell_NotifyIconW 会返回
+        // E_FAIL(0x80004005)。托盘图标失败不致命——键盘钩子不依赖托盘,照常安装;
+        // 启动补建重试定时器,托盘就绪后自动添加,避免提权登录时程序直接退出。
         if !add_tray_icon(hwnd) {
             let err = GetLastError();
-            log_write(&format!("添加托盘图标失败 GetLastError={err}"));
-            show_error(tr().err_add_tray_icon);
-            return;
+            log_write(&format!("添加托盘图标失败 GetLastError={err},启动补建重试"));
+            SetTimer(hwnd, TRAY_RETRY_TIMER_ID, TRAY_RETRY_MS, None);
+        } else {
+            log_write("托盘图标添加成功");
         }
-        log_write("托盘图标添加成功");
 
         let hook: HHOOK = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), hmod, 0);
         if hook.is_null() {
@@ -424,6 +431,7 @@ fn main() {
 
         log_write("程序退出");
         KillTimer(hwnd, CAPS_TIMER_ID);
+        KillTimer(hwnd, TRAY_RETRY_TIMER_ID);
         remove_tray_icon(hwnd);
         destroy_menu_icon_bitmaps();
         destroy_panel_icons();
@@ -497,6 +505,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_TIMER => {
             if wparam == CAPS_TIMER_ID as _ {
                 on_timer_tick();
+            } else if wparam == TRAY_RETRY_TIMER_ID as _ {
+                // 登录竞态补建:托盘就绪后添加成功即停止重试
+                if add_tray_icon(hwnd) {
+                    KillTimer(hwnd, TRAY_RETRY_TIMER_ID);
+                    log_write("托盘图标补建成功(重试)");
+                }
             }
             0
         }
@@ -505,8 +519,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         m if m == TASKBAR_CREATED_MSG.load(Ordering::Relaxed) => {
-            // Explorer 重启:重建托盘图标
-            add_tray_icon(hwnd);
+            // Explorer 重启:重建托盘图标;若重试定时器仍在跑,成功即停止
+            if add_tray_icon(hwnd) {
+                KillTimer(hwnd, TRAY_RETRY_TIMER_ID);
+            }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
